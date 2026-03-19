@@ -88,6 +88,7 @@ const remoteBrowserCookieState = {
 let remoteBrowserSyncPromise = null;
 let remoteBrowserSyncTimer = null;
 let nextCdpMessageId = 1;
+let preferredCdpCookieFetchStrategy = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -503,6 +504,7 @@ function getRemoteBrowserCookieStatus() {
     lastError: remoteBrowserCookieState.lastError,
     lastErrorAt: remoteBrowserCookieState.lastErrorAt,
     syncInProgress: remoteBrowserCookieState.syncInProgress,
+    preferredCdpCookieFetchStrategy,
     diagnostics: getStoredCookieDiagnostics(),
   };
 }
@@ -761,39 +763,59 @@ async function fetchCookiesViaPageTarget(pageWsUrl) {
 
 async function fetchRemoteBrowserCookiesFromCdp() {
   const errors = [];
+  const strategies = {
+    browser_target: async () => {
+      const wsUrl = await resolveRemoteBrowserCdpWsUrl();
+      const methods = ["Storage.getCookies", "Network.getAllCookies"];
+      const strategyErrors = [];
 
-  try {
-    const pageWsUrl = await resolveRemoteBrowserPageTargetWsUrl();
+      for (const method of methods) {
+        try {
+          const result = await callCdp(wsUrl, method, {});
+          const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
 
-    if (pageWsUrl) {
-      return await fetchCookiesViaPageTarget(pageWsUrl);
-    }
-  } catch (err) {
-    errors.push(`page_target: ${err.message}`);
-  }
-
-  try {
-    const wsUrl = await resolveRemoteBrowserCdpWsUrl();
-    const methods = ["Storage.getCookies", "Network.getAllCookies"];
-
-    for (const method of methods) {
-      try {
-        const result = await callCdp(wsUrl, method, {});
-        const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
-
-        return dedupeRemoteBrowserCookies(
-          cookies
-            .map((cookie) => normalizeRemoteBrowserCookie(cookie))
-            .filter(Boolean)
-            .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
-            .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
-        );
-      } catch (err) {
-        errors.push(`${method}: ${err.message}`);
+          return dedupeRemoteBrowserCookies(
+            cookies
+              .map((cookie) => normalizeRemoteBrowserCookie(cookie))
+              .filter(Boolean)
+              .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
+              .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
+          );
+        } catch (err) {
+          strategyErrors.push(`${method}: ${err.message}`);
+        }
       }
+
+      throw new Error(strategyErrors.join("；"));
+    },
+    page_target: async () => {
+      const pageWsUrl = await resolveRemoteBrowserPageTargetWsUrl();
+
+      if (!pageWsUrl) {
+        throw new Error("没有可用的 page target WebSocket");
+      }
+
+      return fetchCookiesViaPageTarget(pageWsUrl);
+    },
+  };
+  const defaultOrder = ["browser_target", "page_target"];
+  const strategyOrder = preferredCdpCookieFetchStrategy
+    ? [
+        preferredCdpCookieFetchStrategy,
+        ...defaultOrder.filter(
+          (name) => name !== preferredCdpCookieFetchStrategy
+        ),
+      ]
+    : defaultOrder;
+
+  for (const strategyName of strategyOrder) {
+    try {
+      const cookies = await strategies[strategyName]();
+      preferredCdpCookieFetchStrategy = strategyName;
+      return cookies;
+    } catch (err) {
+      errors.push(`${strategyName}: ${err.message}`);
     }
-  } catch (err) {
-    errors.push(`browser_target: ${err.message}`);
   }
 
   throw new Error(
