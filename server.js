@@ -87,6 +87,7 @@ const remoteBrowserCookieState = {
 
 let remoteBrowserSyncPromise = null;
 let remoteBrowserSyncTimer = null;
+let nextCdpMessageId = 1;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -565,7 +566,10 @@ async function resolveRemoteBrowserCdpWsUrl() {
 
 async function callCdp(wsUrl, method, params = {}) {
   return new Promise((resolve, reject) => {
-    const id = Date.now();
+    const id = nextCdpMessageId++;
+    if (nextCdpMessageId > 1000000) {
+      nextCdpMessageId = 1;
+    }
     const socket = new WebSocket(wsUrl, {
       handshakeTimeout: REMOTE_BROWSER_CDP_TIMEOUT_MS,
     });
