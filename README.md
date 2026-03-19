@@ -65,6 +65,7 @@ http://127.0.0.1:8765
 | `REQUEST_TIMEOUT_MS` | `10000` | 单次上游请求超时时间（毫秒） |
 | `MAX_RETRIES` | `3` | 最大重试次数 |
 | `RETRY_BASE_DELAY_MS` | `800` | 重试基础退避时间（毫秒） |
+| `EMPTY_RESULT_RETRY_DELAY_MS` | `1500` | 当 `tags` 或 `developers` 为空时，下一次轮询前的等待时间（毫秒） |
 | `STEAM_COOKIE` | 空 | 可选，全局 Steam Cookie |
 | `USER_AGENT` | 内置浏览器 UA | 可选，自定义请求头 UA |
 | `REMOTE_BROWSER_ENABLED` | `false` | 是否开启远程浏览器 Cookie 自动同步 |
@@ -175,6 +176,10 @@ curl -X POST http://127.0.0.1:8765/api/steam-cookies/sync
 请求头：
 
 - `X-Steam-Cookie`：可选，单次请求使用的 Steam Cookie，优先级高于远程浏览器同步 Cookie 和全局 `STEAM_COOKIE`
+
+返回行为：
+
+- 如果 `tags` 或 `developers` 为空，接口会按 `EMPTY_RESULT_RETRY_DELAY_MS` 持续重试，直到两者都拿到非空结果或客户端主动断开连接
 
 请求示例：
 

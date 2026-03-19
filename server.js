@@ -14,6 +14,9 @@ const DEFAULT_LANG = process.env.DEFAULT_LANG || "schinese";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 10000);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
 const RETRY_BASE_DELAY_MS = Number(process.env.RETRY_BASE_DELAY_MS || 800);
+const EMPTY_RESULT_RETRY_DELAY_MS = Number(
+  process.env.EMPTY_RESULT_RETRY_DELAY_MS || 1500
+);
 const REMOTE_BROWSER_ENABLED = parseBooleanEnv(
   process.env.REMOTE_BROWSER_ENABLED || "false"
 );
@@ -916,13 +919,15 @@ function toAbsoluteStoreUrl(href = "") {
 }
 
 function isAgeGate(html = "", url = "") {
+  const normalizedHtml = String(html || "");
+
   return (
     url.includes("/agecheck/") ||
-    /Please enter your birth date to continue/i.test(html) ||
-    /By clicking the .?View Page.? button below you affirm that you are at least eighteen years old/i.test(
-      html
-    ) ||
-    /This game may contain content not appropriate for all ages/i.test(html)
+    /Please enter your birth date to continue/i.test(normalizedHtml) ||
+    /name=["']ageDay["']/i.test(normalizedHtml) ||
+    /name=["']ageMonth["']/i.test(normalizedHtml) ||
+    /name=["']ageYear["']/i.test(normalizedHtml) ||
+    /agecheckset/i.test(normalizedHtml)
   );
 }
 
@@ -959,6 +964,15 @@ function looksLikeLoginOrPreferenceRestricted(html = "") {
 function scoreSteamResult(result = {}) {
   return (Array.isArray(result.tags) ? result.tags.length : 0) * 10 +
     (Array.isArray(result.developers) ? result.developers.length : 0);
+}
+
+function hasCompleteTagPayload(result = {}) {
+  return (
+    Array.isArray(result.tags) &&
+    result.tags.length > 0 &&
+    Array.isArray(result.developers) &&
+    result.developers.length > 0
+  );
 }
 
 function buildLoginRestrictionMessage() {
@@ -1336,6 +1350,11 @@ app.get("/api/app/:appid/tags", async (req, res) => {
   const { appid } = req.params;
   const lang = String(req.query.lang || DEFAULT_LANG).trim();
   const requestCookie = req.header("x-steam-cookie") || "";
+  let requestClosed = false;
+
+  req.on("close", () => {
+    requestClosed = true;
+  });
 
   if (!/^\d+$/.test(appid)) {
     return res.status(400).json({
@@ -1347,65 +1366,64 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 
   try {
     const requestHasExplicitCookie = Boolean(requestCookie);
-    const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
-      useStoredAuthCookies: false,
-    });
-    let result = anonymousResult;
 
-    const shouldRetryWithStoredAuth =
-      !requestHasExplicitCookie &&
-      hasStoredAuthCookies() &&
-      (anonymousResult.tags.length === 0 ||
-        anonymousResult.developers.length === 0 ||
-        looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml));
-
-    if (shouldRetryWithStoredAuth) {
-      const authenticatedResult = await fetchSteamTags(appid, lang, "", {
-        useStoredAuthCookies: true,
+    while (!requestClosed) {
+      const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
+        useStoredAuthCookies: false,
       });
+      let result = anonymousResult;
 
-      if (
-        scoreSteamResult(authenticatedResult) > scoreSteamResult(anonymousResult) ||
-        (looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml) &&
-          !looksLikeLoginOrPreferenceRestricted(authenticatedResult.rawHtml))
-      ) {
-        result = authenticatedResult;
+      const shouldRetryWithStoredAuth =
+        !requestHasExplicitCookie &&
+        hasStoredAuthCookies() &&
+        (anonymousResult.tags.length === 0 ||
+          anonymousResult.developers.length === 0 ||
+          looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml));
+
+      if (shouldRetryWithStoredAuth) {
+        const authenticatedResult = await fetchSteamTags(appid, lang, "", {
+          useStoredAuthCookies: true,
+        });
+
+        if (
+          scoreSteamResult(authenticatedResult) > scoreSteamResult(anonymousResult) ||
+          (looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml) &&
+            !looksLikeLoginOrPreferenceRestricted(authenticatedResult.rawHtml))
+        ) {
+          result = authenticatedResult;
+        }
       }
-    }
 
-    // 明确判断：依然是年龄门
-    if (isAgeGate(result.rawHtml, result.finalUrl)) {
-      return res.status(403).json({
-        success: false,
-        error: "AGE_GATE_BLOCKED",
-        message: "页面仍然停留在年龄验证，当前无法继续获取标签",
+      if (requestClosed) {
+        return;
+      }
+
+      // 明确判断：依然是年龄门
+      if (isAgeGate(result.rawHtml, result.finalUrl)) {
+        await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
+        continue;
+      }
+
+      if (!hasCompleteTagPayload(result)) {
+        await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
+        continue;
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          appid: result.appid,
+          name: result.name,
+          aliases: result.aliases,
+          releaseDate: result.releaseDate,
+          tags: result.tags,
+          developers: result.developers,
+        },
+        warning: null,
       });
     }
 
-    // 可能是登录态 / 成熟内容偏好 / 地区限制
-    if (result.tags.length === 0 && looksLikeLoginOrPreferenceRestricted(result.rawHtml)) {
-      return res.status(403).json({
-        success: false,
-        error: "LOGIN_OR_PREFERENCE_REQUIRED",
-        message: buildLoginRestrictionMessage(),
-      });
-    }
-
-    return res.json({
-      success: true,
-      data: {
-        appid: result.appid,
-        name: result.name,
-        aliases: result.aliases,
-        releaseDate: result.releaseDate,
-        tags: result.tags,
-        developers: result.developers,
-      },
-      warning:
-        result.tags.length === 0
-          ? "未提取到标签。可能是页面结构变动，或该页面仍受登录态/偏好/地区限制。"
-          : null,
-    });
+    return;
   } catch (err) {
     const message =
       err?.response?.status
