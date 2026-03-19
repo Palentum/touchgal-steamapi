@@ -8,6 +8,9 @@
 
 - 根据 `appid` 抓取 Steam 商店页标签
 - 提取开发者名称和对应的 Steam 链接
+- 获取默认简体中文游戏名
+- 获取英文、日文、繁体中文名称别名
+- 获取并格式化发售日期为 `yyyy-mm-dd`
 - 自动尝试通过常见年龄验证页
 - 支持全局 Steam Cookie 或单次请求注入 Cookie
 - 内置超时、重试和退避逻辑
@@ -95,7 +98,7 @@ curl http://127.0.0.1:8765/health
 
 ### `GET /api/app/:appid/tags`
 
-根据 Steam `appid` 抓取标签和开发者信息。
+根据 Steam `appid` 抓取标签、开发者、多语言名称和发售日期信息。
 
 查询参数：
 
@@ -125,6 +128,13 @@ curl "http://127.0.0.1:8765/api/app/620/tags?lang=schinese" \
   "success": true,
   "data": {
     "appid": "620",
+    "name": "传送门 2",
+    "aliases": {
+      "english": "Portal 2",
+      "japanese": "Portal 2",
+      "tchinese": "傳送門 2"
+    },
+    "releaseDate": "2011-04-19",
     "tags": ["动作", "解谜", "合作"],
     "developers": [
       {
@@ -144,6 +154,13 @@ curl "http://127.0.0.1:8765/api/app/620/tags?lang=schinese" \
   "success": true,
   "data": {
     "appid": "123456",
+    "name": null,
+    "aliases": {
+      "english": null,
+      "japanese": null,
+      "tchinese": null
+    },
+    "releaseDate": null,
     "tags": [],
     "developers": []
   },
@@ -221,7 +238,8 @@ curl "http://127.0.0.1:8765/api/app/620/tags?lang=schinese" \
 
 ## 已知限制
 
-- 当前只提供标签和开发者信息，不包含价格、简介、截图等字段
+- 当前返回名称、发售日期、标签和开发者信息，不包含价格、简介、截图等字段
+- 名称和发售日期来自 `appdetails` 接口，若上游未返回或日期不可解析，对应字段会是 `null`
 - 依赖 Steam 商店前端页面结构，结构变更会影响提取结果
 - 某些页面即使带 Cookie，仍可能受到地区、账号年龄或偏好设置影响
 
@@ -240,4 +258,3 @@ curl "http://127.0.0.1:8765/api/app/620/tags?lang=schinese" \
 - 增加 Dockerfile
 - 补单元测试和集成测试
 - 提供更多字段提取能力
-

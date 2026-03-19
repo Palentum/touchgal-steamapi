@@ -20,6 +20,33 @@ const DEFAULT_USER_AGENT =
   process.env.USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
+const ENGLISH_MONTH_MAP = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12,
+};
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -147,6 +174,82 @@ function getFinalUrl(response, fallback) {
 
 function normalizeText(value = "") {
   return String(value).replace(/\s+/g, " ").trim();
+}
+
+function normalizeName(value = "") {
+  const normalized = normalizeText(value);
+  return normalized || null;
+}
+
+function safeParseJson(payload) {
+  if (payload && typeof payload === "object") {
+    return payload;
+  }
+
+  if (typeof payload !== "string") {
+    return null;
+  }
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+function formatDateParts(year, month, day) {
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+
+  if (
+    !Number.isInteger(y) ||
+    !Number.isInteger(m) ||
+    !Number.isInteger(d) ||
+    m < 1 ||
+    m > 12 ||
+    d < 1 ||
+    d > 31
+  ) {
+    return null;
+  }
+
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(
+    d
+  ).padStart(2, "0")}`;
+}
+
+function normalizeReleaseDate(value = "") {
+  const text = normalizeText(value);
+  if (!text) return null;
+
+  let match = text.match(/^(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})$/);
+  if (match) {
+    return formatDateParts(match[1], match[2], match[3]);
+  }
+
+  match = text.match(/^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日$/);
+  if (match) {
+    return formatDateParts(match[1], match[2], match[3]);
+  }
+
+  match = text.match(/^(\d{1,2})\s+([A-Za-z.]+),?\s+(\d{4})$/);
+  if (match) {
+    const month = ENGLISH_MONTH_MAP[match[2].replace(/\./g, "").toLowerCase()];
+    if (month) {
+      return formatDateParts(match[3], month, match[1]);
+    }
+  }
+
+  match = text.match(/^([A-Za-z.]+)\s+(\d{1,2}),?\s+(\d{4})$/);
+  if (match) {
+    const month = ENGLISH_MONTH_MAP[match[1].replace(/\./g, "").toLowerCase()];
+    if (month) {
+      return formatDateParts(match[3], month, match[2]);
+    }
+  }
+
+  return null;
 }
 
 function toAbsoluteStoreUrl(href = "") {
@@ -380,6 +483,52 @@ function extractTags(html) {
   };
 }
 
+async function fetchAppDetails(client, appid, lang) {
+  const url = `https://store.steampowered.com/api/appdetails?appids=${encodeURIComponent(
+    appid
+  )}&l=${encodeURIComponent(lang)}`;
+
+  const response = await requestWithRetry(client, {
+    method: "GET",
+    url,
+    headers: buildRequestHeaders(lang),
+  });
+
+  const payload = safeParseJson(response.data);
+  const entry = payload?.[String(appid)];
+
+  if (!entry?.success || !entry.data) {
+    return null;
+  }
+
+  return entry.data;
+}
+
+async function fetchLocalizedAppMetadata(client, appid) {
+  const detailRequests = await Promise.allSettled([
+    fetchAppDetails(client, appid, "schinese"),
+    fetchAppDetails(client, appid, "english"),
+    fetchAppDetails(client, appid, "japanese"),
+    fetchAppDetails(client, appid, "tchinese"),
+  ]);
+
+  const [schinese, english, japanese, tchinese] = detailRequests.map((result) =>
+    result.status === "fulfilled" ? result.value : null
+  );
+
+  return {
+    name: normalizeName(schinese?.name),
+    aliases: {
+      english: normalizeName(english?.name),
+      japanese: normalizeName(japanese?.name),
+      tchinese: normalizeName(tchinese?.name),
+    },
+    releaseDate:
+      normalizeReleaseDate(schinese?.release_date?.date) ||
+      normalizeReleaseDate(english?.release_date?.date),
+  };
+}
+
 async function fetchSteamTags(appid, lang, rawCookieHeader = "") {
   const jar = new CookieJar();
   await seedJar(jar, rawCookieHeader);
@@ -418,11 +567,15 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "") {
   }
 
   const { tags, developers } = extractTags(html);
+  const metadata = await fetchLocalizedAppMetadata(client, appid);
 
   const usedAuthenticatedCookie = Boolean(rawCookieHeader || GLOBAL_STEAM_COOKIE);
 
   return {
     appid: String(appid),
+    name: metadata.name,
+    aliases: metadata.aliases,
+    releaseDate: metadata.releaseDate,
     finalUrl,
     tags,
     developers,
@@ -478,6 +631,9 @@ app.get("/api/app/:appid/tags", async (req, res) => {
       success: true,
       data: {
         appid: result.appid,
+        name: result.name,
+        aliases: result.aliases,
+        releaseDate: result.releaseDate,
         tags: result.tags,
         developers: result.developers,
       },
