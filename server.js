@@ -447,6 +447,45 @@ function setRemoteBrowserCookies(cookies = [], source = null) {
   remoteBrowserCookieState.source = source;
 }
 
+function summarizeDomainCookies(domain = "") {
+  const normalizedDomain = normalizeCookieDomain(domain);
+  const cookies = remoteBrowserCookieState.cookies.filter(
+    (cookie) => cookie.domain === normalizedDomain
+  );
+
+  return {
+    count: cookies.length,
+    names: cookies.map((cookie) => cookie.name).sort(),
+  };
+}
+
+function getStoredCookieDiagnostics() {
+  const storeSummary = summarizeDomainCookies("store.steampowered.com");
+  const communitySummary = summarizeDomainCookies("steamcommunity.com");
+  const storeCookieNames = new Set(storeSummary.names);
+
+  return {
+    store: {
+      count: storeSummary.count,
+      hasSessionId: storeCookieNames.has("sessionid"),
+      hasSteamLoginSecure: storeCookieNames.has("steamLoginSecure"),
+      hasBirthtime: storeCookieNames.has("birthtime"),
+      hasLastAgeCheckAge: storeCookieNames.has("lastagecheckage"),
+      hasMatureContentPrefs:
+        storeCookieNames.has("wants_mature_content") ||
+        storeCookieNames.has("wants_mature_content_sex") ||
+        storeCookieNames.has("wants_mature_content_violence"),
+    },
+    community: {
+      count: communitySummary.count,
+      hasSessionId: new Set(communitySummary.names).has("sessionid"),
+      hasSteamLoginSecure: new Set(communitySummary.names).has(
+        "steamLoginSecure"
+      ),
+    },
+  };
+}
+
 function getRemoteBrowserCookieStatus() {
   return {
     enabled: REMOTE_BROWSER_ENABLED,
@@ -464,6 +503,7 @@ function getRemoteBrowserCookieStatus() {
     lastError: remoteBrowserCookieState.lastError,
     lastErrorAt: remoteBrowserCookieState.lastErrorAt,
     syncInProgress: remoteBrowserCookieState.syncInProgress,
+    diagnostics: getStoredCookieDiagnostics(),
   };
 }
 
@@ -899,6 +939,28 @@ function scoreSteamResult(result = {}) {
     (Array.isArray(result.developers) ? result.developers.length : 0);
 }
 
+function buildLoginRestrictionMessage() {
+  const diagnostics = getStoredCookieDiagnostics();
+
+  if (
+    remoteBrowserCookieState.cookieCount > 0 &&
+    diagnostics.community.hasSteamLoginSecure &&
+    !diagnostics.store.hasSteamLoginSecure
+  ) {
+    return "当前已同步到 Steam Community 登录态，但看起来还没有 Store 侧登录态。请在远程浏览器里打开 https://store.steampowered.com/ 并确认右上角显示你的账号已登录，然后重新同步 Cookie。";
+  }
+
+  if (
+    remoteBrowserCookieState.cookieCount > 0 &&
+    diagnostics.store.hasSteamLoginSecure &&
+    !diagnostics.store.hasMatureContentPrefs
+  ) {
+    return "当前已同步到 Steam Store 登录态，但缺少商店成人内容偏好 Cookie。请在远程浏览器里打开 Steam 商店偏好设置，勾选成人/仅限成年人内容后重新同步 Cookie。";
+  }
+
+  return "这个页面大概率需要登录后的 Steam 账号权限、成熟内容偏好设置，或受地区限制。请传入你自己的 Steam Cookie，或开启远程浏览器 Cookie 同步。";
+}
+
 function pickSelectValue($, $select, matchers) {
   const options = $select.find("option").toArray();
 
@@ -1303,8 +1365,7 @@ app.get("/api/app/:appid/tags", async (req, res) => {
       return res.status(403).json({
         success: false,
         error: "LOGIN_OR_PREFERENCE_REQUIRED",
-        message:
-          "这个页面大概率需要登录后的 Steam 账号权限、成熟内容偏好设置，或受地区限制。请传入你自己的 Steam Cookie，或开启远程浏览器 Cookie 同步。",
+        message: buildLoginRestrictionMessage(),
       });
     }
 
