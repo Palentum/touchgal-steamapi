@@ -221,16 +221,23 @@ async function seedRemoteBrowserCookies(jar) {
   }
 }
 
-async function seedJar(jar, rawCookieHeader = "") {
+function hasStoredAuthCookies() {
+  return Boolean(GLOBAL_STEAM_COOKIE || remoteBrowserCookieState.cookieCount > 0);
+}
+
+async function seedJar(jar, rawCookieHeader = "", options = {}) {
+  const { useStoredAuthCookies = true } = options;
   const baseUrl = "https://store.steampowered.com/";
 
-  // 全局登录态
-  for (const pair of splitCookieHeader(GLOBAL_STEAM_COOKIE)) {
-    await jar.setCookie(pair, baseUrl);
-  }
+  if (useStoredAuthCookies) {
+    // 全局登录态
+    for (const pair of splitCookieHeader(GLOBAL_STEAM_COOKIE)) {
+      await jar.setCookie(pair, baseUrl);
+    }
 
-  // 远程浏览器同步到本地的登录态
-  await seedRemoteBrowserCookies(jar);
+    // 远程浏览器同步到本地的登录态
+    await seedRemoteBrowserCookies(jar);
+  }
 
   // 单次请求登录态，优先级更高
   for (const pair of splitCookieHeader(rawCookieHeader)) {
@@ -1110,9 +1117,12 @@ async function fetchLocalizedAppMetadata(client, appid) {
   };
 }
 
-async function fetchSteamTags(appid, lang, rawCookieHeader = "") {
+async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
+  const { useStoredAuthCookies = true } = options;
   const jar = new CookieJar();
-  await seedJar(jar, rawCookieHeader);
+  await seedJar(jar, rawCookieHeader, {
+    useStoredAuthCookies,
+  });
 
   const client = createClient(jar);
   const appUrl = `https://store.steampowered.com/app/${appid}/?l=${encodeURIComponent(
@@ -1151,9 +1161,7 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "") {
   const metadata = await fetchLocalizedAppMetadata(client, appid);
 
   const usedAuthenticatedCookie = Boolean(
-    rawCookieHeader ||
-      GLOBAL_STEAM_COOKIE ||
-      remoteBrowserCookieState.cookieCount > 0
+    rawCookieHeader || (useStoredAuthCookies && hasStoredAuthCookies())
   );
 
   return {
@@ -1228,7 +1236,22 @@ app.get("/api/app/:appid/tags", async (req, res) => {
   }
 
   try {
-    const result = await fetchSteamTags(appid, lang, requestCookie);
+    const requestHasExplicitCookie = Boolean(requestCookie);
+    let result = await fetchSteamTags(appid, lang, requestCookie, {
+      useStoredAuthCookies: false,
+    });
+
+    const shouldRetryWithStoredAuth =
+      !requestHasExplicitCookie &&
+      hasStoredAuthCookies() &&
+      result.tags.length === 0 &&
+      looksLikeLoginOrPreferenceRestricted(result.rawHtml);
+
+    if (shouldRetryWithStoredAuth) {
+      result = await fetchSteamTags(appid, lang, "", {
+        useStoredAuthCookies: true,
+      });
+    }
 
     // 明确判断：依然是年龄门
     if (isAgeGate(result.rawHtml, result.finalUrl)) {
