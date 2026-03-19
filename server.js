@@ -154,7 +154,9 @@ function toAbsoluteStoreUrl(href = "") {
   if (!normalizedHref) return null;
 
   try {
-    return new URL(normalizedHref, "https://store.steampowered.com").toString();
+    const url = new URL(normalizedHref, "https://store.steampowered.com");
+    url.searchParams.delete("snr");
+    return url.toString();
   } catch {
     return null;
   }
