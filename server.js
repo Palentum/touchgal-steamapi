@@ -145,6 +145,21 @@ function getFinalUrl(response, fallback) {
   return response?.request?.res?.responseUrl || fallback;
 }
 
+function normalizeText(value = "") {
+  return String(value).replace(/\s+/g, " ").trim();
+}
+
+function toAbsoluteStoreUrl(href = "") {
+  const normalizedHref = String(href || "").trim();
+  if (!normalizedHref) return null;
+
+  try {
+    return new URL(normalizedHref, "https://store.steampowered.com").toString();
+  } catch {
+    return null;
+  }
+}
+
 function isAgeGate(html = "", url = "") {
   return (
     url.includes("/agecheck/") ||
@@ -323,16 +338,10 @@ async function passAgeGateIfNeeded(client, appid, lang) {
 function extractTags(html) {
   const $ = cheerio.load(html);
 
-  const name =
-    $(".apphub_AppName").first().text().trim() ||
-    $('meta[property="og:title"]').attr("content")?.trim() ||
-    $("title").first().text().trim() ||
-    null;
-
   let tags = $(
     ".glance_tags.popular_tags a.app_tag, .glance_tags a.app_tag, .glance_tags_ctn a.app_tag"
   )
-    .map((_, el) => $(el).text().replace(/\s+/g, " ").trim())
+    .map((_, el) => normalizeText($(el).text()))
     .get()
     .filter(Boolean)
     .filter((tag) => tag !== "+")
@@ -340,9 +349,32 @@ function extractTags(html) {
 
   tags = [...new Set(tags)];
 
+  const developers = $("#developers_list a")
+    .map((_, el) => {
+      const $el = $(el);
+      const developerName = normalizeText($el.text());
+      const developerLink = toAbsoluteStoreUrl($el.attr("href"));
+
+      if (!developerName || !developerLink) return null;
+
+      return {
+        name: developerName,
+        link: developerLink,
+      };
+    })
+    .get()
+    .filter(Boolean)
+    .filter(
+      (developer, index, list) =>
+        list.findIndex(
+          (item) =>
+            item.name === developer.name && item.link === developer.link
+        ) === index
+    );
+
   return {
-    name,
     tags,
+    developers,
   };
 }
 
@@ -383,17 +415,15 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "") {
     finalUrl = getFinalUrl(response, appUrl);
   }
 
-  const { name, tags } = extractTags(html);
+  const { tags, developers } = extractTags(html);
 
   const usedAuthenticatedCookie = Boolean(rawCookieHeader || GLOBAL_STEAM_COOKIE);
 
   return {
     appid: String(appid),
-    lang,
-    url: appUrl,
     finalUrl,
-    name,
     tags,
+    developers,
     ageGateHandled,
     usedAuthenticatedCookie,
     rawHtml: html,
@@ -429,13 +459,6 @@ app.get("/api/app/:appid/tags", async (req, res) => {
         success: false,
         error: "AGE_GATE_BLOCKED",
         message: "页面仍然停留在年龄验证，当前无法继续获取标签",
-        meta: {
-          appid: result.appid,
-          lang: result.lang,
-          usedAuthenticatedCookie: result.usedAuthenticatedCookie,
-          ageGateHandled: result.ageGateHandled,
-          finalUrl: result.finalUrl,
-        },
       });
     }
 
@@ -446,13 +469,6 @@ app.get("/api/app/:appid/tags", async (req, res) => {
         error: "LOGIN_OR_PREFERENCE_REQUIRED",
         message:
           "这个页面大概率需要登录后的 Steam 账号权限、成熟内容偏好设置，或受地区限制。请传入你自己的 Steam Cookie。",
-        meta: {
-          appid: result.appid,
-          lang: result.lang,
-          usedAuthenticatedCookie: result.usedAuthenticatedCookie,
-          ageGateHandled: result.ageGateHandled,
-          finalUrl: result.finalUrl,
-        },
       });
     }
 
@@ -460,15 +476,8 @@ app.get("/api/app/:appid/tags", async (req, res) => {
       success: true,
       data: {
         appid: result.appid,
-        name: result.name,
         tags: result.tags,
-        lang: result.lang,
-        url: result.url,
-      },
-      meta: {
-        usedAuthenticatedCookie: result.usedAuthenticatedCookie,
-        ageGateHandled: result.ageGateHandled,
-        finalUrl: result.finalUrl,
+        developers: result.developers,
       },
       warning:
         result.tags.length === 0
