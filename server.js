@@ -514,6 +514,34 @@ async function persistRemoteBrowserCookies(cookies = []) {
   );
 }
 
+async function fetchRemoteBrowserJson(pathname) {
+  if (!REMOTE_BROWSER_CDP_HTTP_URL) {
+    throw new Error("未配置 REMOTE_BROWSER_CDP_HTTP_URL");
+  }
+
+  const response = await requestWithRetry(axios, {
+    method: "GET",
+    url: `${REMOTE_BROWSER_CDP_HTTP_URL}${pathname}`,
+    timeout: REMOTE_BROWSER_CDP_TIMEOUT_MS,
+    headers: {
+      ...buildRequestHeaders("english"),
+      Accept: "application/json",
+    },
+  });
+
+  if (response.status >= 400) {
+    throw new Error(`读取远程浏览器调试信息失败: HTTP ${response.status}`);
+  }
+
+  const payload = safeParseJson(response.data);
+
+  if (!payload) {
+    throw new Error(`远程浏览器返回了无效 JSON: ${pathname}`);
+  }
+
+  return payload;
+}
+
 async function resolveRemoteBrowserCdpWsUrl() {
   if (REMOTE_BROWSER_CDP_WS_URL) {
     return REMOTE_BROWSER_CDP_WS_URL;
@@ -525,21 +553,7 @@ async function resolveRemoteBrowserCdpWsUrl() {
     );
   }
 
-  const response = await requestWithRetry(axios, {
-    method: "GET",
-    url: `${REMOTE_BROWSER_CDP_HTTP_URL}/json/version`,
-    timeout: REMOTE_BROWSER_CDP_TIMEOUT_MS,
-    headers: {
-      ...buildRequestHeaders("english"),
-      Accept: "application/json",
-    },
-  });
-
-  if (response.status >= 400) {
-    throw new Error(`获取远程浏览器调试地址失败: HTTP ${response.status}`);
-  }
-
-  const payload = safeParseJson(response.data);
+  const payload = await fetchRemoteBrowserJson("/json/version");
   const wsUrl = String(payload?.webSocketDebuggerUrl || "").trim();
 
   if (!wsUrl) {
@@ -625,14 +639,58 @@ async function callCdp(wsUrl, method, params = {}) {
   });
 }
 
-async function fetchRemoteBrowserCookiesFromCdp() {
-  const wsUrl = await resolveRemoteBrowserCdpWsUrl();
-  const methods = ["Storage.getCookies", "Network.getAllCookies"];
+function pickRemoteBrowserPageTarget(targets = []) {
+  const candidates = targets
+    .filter((target) => target?.type === "page")
+    .filter((target) => String(target?.webSocketDebuggerUrl || "").trim());
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  const preferredTarget = candidates.find((target) => {
+    const targetUrl = String(target?.url || "").trim();
+
+    return REMOTE_BROWSER_COOKIE_DOMAINS.some((domain) =>
+      targetUrl.includes(domain)
+    );
+  });
+
+  return preferredTarget || candidates[0];
+}
+
+async function resolveRemoteBrowserPageTargetWsUrl() {
+  if (!REMOTE_BROWSER_CDP_HTTP_URL) {
+    return null;
+  }
+
+  const targets = await fetchRemoteBrowserJson("/json/list");
+  const target = pickRemoteBrowserPageTarget(
+    Array.isArray(targets) ? targets : []
+  );
+
+  return String(target?.webSocketDebuggerUrl || "").trim() || null;
+}
+
+async function fetchCookiesViaPageTarget(pageWsUrl) {
+  const urls = REMOTE_BROWSER_COOKIE_DOMAINS.map(
+    (domain) => `https://${domain}/`
+  );
+  const methods = [
+    {
+      name: "Network.getCookies(page_target)",
+      execute: () => callCdp(pageWsUrl, "Network.getCookies", { urls }),
+    },
+    {
+      name: "Storage.getCookies(page_target)",
+      execute: () => callCdp(pageWsUrl, "Storage.getCookies", {}),
+    },
+  ];
   const errors = [];
 
   for (const method of methods) {
     try {
-      const result = await callCdp(wsUrl, method, {});
+      const result = await method.execute();
       const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
 
       return dedupeRemoteBrowserCookies(
@@ -643,8 +701,48 @@ async function fetchRemoteBrowserCookiesFromCdp() {
           .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
       );
     } catch (err) {
-      errors.push(`${method}: ${err.message}`);
+      errors.push(`${method.name}: ${err.message}`);
     }
+  }
+
+  throw new Error(errors.join("；"));
+}
+
+async function fetchRemoteBrowserCookiesFromCdp() {
+  const errors = [];
+
+  try {
+    const pageWsUrl = await resolveRemoteBrowserPageTargetWsUrl();
+
+    if (pageWsUrl) {
+      return await fetchCookiesViaPageTarget(pageWsUrl);
+    }
+  } catch (err) {
+    errors.push(`page_target: ${err.message}`);
+  }
+
+  try {
+    const wsUrl = await resolveRemoteBrowserCdpWsUrl();
+    const methods = ["Storage.getCookies", "Network.getAllCookies"];
+
+    for (const method of methods) {
+      try {
+        const result = await callCdp(wsUrl, method, {});
+        const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
+
+        return dedupeRemoteBrowserCookies(
+          cookies
+            .map((cookie) => normalizeRemoteBrowserCookie(cookie))
+            .filter(Boolean)
+            .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
+            .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
+        );
+      } catch (err) {
+        errors.push(`${method}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    errors.push(`browser_target: ${err.message}`);
   }
 
   throw new Error(
