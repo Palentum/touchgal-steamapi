@@ -1,8 +1,11 @@
 const express = require("express");
+const fs = require("fs/promises");
+const path = require("path");
 const axios = require("axios");
 const { wrapper } = require("axios-cookiejar-support");
 const { CookieJar } = require("tough-cookie");
 const cheerio = require("cheerio");
+const WebSocket = require("ws");
 
 const app = express();
 
@@ -11,6 +14,30 @@ const DEFAULT_LANG = process.env.DEFAULT_LANG || "schinese";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 10000);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
 const RETRY_BASE_DELAY_MS = Number(process.env.RETRY_BASE_DELAY_MS || 800);
+const REMOTE_BROWSER_ENABLED = parseBooleanEnv(
+  process.env.REMOTE_BROWSER_ENABLED || "false"
+);
+const REMOTE_BROWSER_CDP_HTTP_URL = trimTrailingSlash(
+  process.env.REMOTE_BROWSER_CDP_HTTP_URL || ""
+);
+const REMOTE_BROWSER_CDP_WS_URL = String(
+  process.env.REMOTE_BROWSER_CDP_WS_URL || ""
+).trim();
+const REMOTE_BROWSER_SYNC_INTERVAL_MS = Number(
+  process.env.REMOTE_BROWSER_SYNC_INTERVAL_MS || 60000
+);
+const REMOTE_BROWSER_CDP_TIMEOUT_MS = Number(
+  process.env.REMOTE_BROWSER_CDP_TIMEOUT_MS || REQUEST_TIMEOUT_MS
+);
+const REMOTE_BROWSER_COOKIE_STORE_PATH = path.resolve(
+  process.cwd(),
+  process.env.REMOTE_BROWSER_COOKIE_STORE_PATH ||
+    "./steam-remote-browser-cookies.json"
+);
+const REMOTE_BROWSER_COOKIE_DOMAINS = parseCsvList(
+  process.env.REMOTE_BROWSER_COOKIE_DOMAINS ||
+    "store.steampowered.com,steamcommunity.com,help.steampowered.com"
+);
 
 // 可选：把你自己浏览器里的 Steam Cookie 整串放到环境变量里。
 // 也可以每次请求时通过 X-Steam-Cookie 请求头单独传入。
@@ -47,8 +74,43 @@ const ENGLISH_MONTH_MAP = {
   december: 12,
 };
 
+const remoteBrowserCookieState = {
+  cookies: [],
+  cookieCount: 0,
+  lastSyncAt: null,
+  lastSyncOkAt: null,
+  lastError: null,
+  lastErrorAt: null,
+  source: null,
+  syncInProgress: false,
+};
+
+let remoteBrowserSyncPromise = null;
+let remoteBrowserSyncTimer = null;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseBooleanEnv(value = "") {
+  return ["1", "true", "yes", "on"].includes(
+    String(value || "")
+      .trim()
+      .toLowerCase()
+  );
+}
+
+function trimTrailingSlash(value = "") {
+  return String(value || "")
+    .trim()
+    .replace(/\/+$/, "");
+}
+
+function parseCsvList(value = "") {
+  return String(value || "")
+    .split(",")
+    .map((item) => String(item || "").trim().toLowerCase())
+    .filter(Boolean);
 }
 
 function buildRequestHeaders(lang) {
@@ -90,7 +152,10 @@ async function requestWithRetry(client, config) {
     try {
       const response = await client.request({
         ...config,
-        timeout: REQUEST_TIMEOUT_MS,
+        timeout:
+          Number.isFinite(Number(config.timeout)) && Number(config.timeout) > 0
+            ? Number(config.timeout)
+            : REQUEST_TIMEOUT_MS,
         validateStatus: () => true,
       });
 
@@ -133,6 +198,28 @@ function splitCookieHeader(raw = "") {
     .filter((s) => s.includes("="));
 }
 
+async function seedRemoteBrowserCookies(jar) {
+  for (const cookie of remoteBrowserCookieState.cookies) {
+    if (
+      !cookie?.name ||
+      !cookie?.domain ||
+      isExpiredRemoteBrowserCookie(cookie) ||
+      !isAllowedRemoteBrowserCookieDomain(cookie.domain)
+    ) {
+      continue;
+    }
+
+    try {
+      await jar.setCookie(
+        serializeCookieForJar(cookie),
+        `https://${cookie.domain}${cookie.path || "/"}`
+      );
+    } catch {
+      // 忽略单个损坏 cookie，避免整个请求失败
+    }
+  }
+}
+
 async function seedJar(jar, rawCookieHeader = "") {
   const baseUrl = "https://store.steampowered.com/";
 
@@ -140,6 +227,9 @@ async function seedJar(jar, rawCookieHeader = "") {
   for (const pair of splitCookieHeader(GLOBAL_STEAM_COOKIE)) {
     await jar.setCookie(pair, baseUrl);
   }
+
+  // 远程浏览器同步到本地的登录态
+  await seedRemoteBrowserCookies(jar);
 
   // 单次请求登录态，优先级更高
   for (const pair of splitCookieHeader(rawCookieHeader)) {
@@ -250,6 +340,395 @@ function normalizeReleaseDate(value = "") {
   }
 
   return null;
+}
+
+function normalizeCookieDomain(value = "") {
+  return String(value || "")
+    .trim()
+    .replace(/^\./, "")
+    .toLowerCase();
+}
+
+function isRemoteBrowserSyncConfigured() {
+  return Boolean(REMOTE_BROWSER_CDP_WS_URL || REMOTE_BROWSER_CDP_HTTP_URL);
+}
+
+function isAllowedRemoteBrowserCookieDomain(domain = "") {
+  const normalizedDomain = normalizeCookieDomain(domain);
+  if (!normalizedDomain) return false;
+
+  return REMOTE_BROWSER_COOKIE_DOMAINS.some(
+    (allowedDomain) =>
+      normalizedDomain === allowedDomain ||
+      normalizedDomain.endsWith(`.${allowedDomain}`)
+  );
+}
+
+function normalizeRemoteBrowserCookie(cookie = {}) {
+  const name = String(cookie.name || "").trim();
+  const domain = normalizeCookieDomain(cookie.domain);
+  const pathValue = String(cookie.path || "/").trim() || "/";
+  const expires = Number(cookie.expires);
+
+  if (!name || !domain) {
+    return null;
+  }
+
+  return {
+    name,
+    value: String(cookie.value || ""),
+    domain,
+    path: pathValue.startsWith("/") ? pathValue : `/${pathValue}`,
+    secure: Boolean(cookie.secure),
+    httpOnly: Boolean(cookie.httpOnly),
+    sameSite: cookie.sameSite || null,
+    expires: Number.isFinite(expires) ? expires : -1,
+  };
+}
+
+function dedupeRemoteBrowserCookies(cookies = []) {
+  const uniqueCookies = new Map();
+
+  for (const cookie of cookies) {
+    const key = [cookie.domain, cookie.path, cookie.name].join("\t");
+    uniqueCookies.set(key, cookie);
+  }
+
+  return [...uniqueCookies.values()];
+}
+
+function isExpiredRemoteBrowserCookie(cookie = {}) {
+  return (
+    Number.isFinite(cookie.expires) &&
+    cookie.expires > 0 &&
+    cookie.expires * 1000 <= Date.now()
+  );
+}
+
+function serializeCookieForJar(cookie = {}) {
+  let serialized = `${cookie.name}=${cookie.value}; Domain=${cookie.domain}; Path=${
+    cookie.path || "/"
+  }`;
+
+  if (cookie.secure) {
+    serialized += "; Secure";
+  }
+
+  if (cookie.httpOnly) {
+    serialized += "; HttpOnly";
+  }
+
+  if (Number.isFinite(cookie.expires) && cookie.expires > 0) {
+    serialized += `; Expires=${new Date(cookie.expires * 1000).toUTCString()}`;
+  }
+
+  return serialized;
+}
+
+function setRemoteBrowserCookies(cookies = [], source = null) {
+  const normalizedCookies = dedupeRemoteBrowserCookies(
+    cookies
+      .map((cookie) => normalizeRemoteBrowserCookie(cookie))
+      .filter(Boolean)
+      .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
+      .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
+  );
+
+  remoteBrowserCookieState.cookies = normalizedCookies;
+  remoteBrowserCookieState.cookieCount = normalizedCookies.length;
+  remoteBrowserCookieState.source = source;
+}
+
+function getRemoteBrowserCookieStatus() {
+  return {
+    enabled: REMOTE_BROWSER_ENABLED,
+    configured: isRemoteBrowserSyncConfigured(),
+    cdpHttpUrl: REMOTE_BROWSER_CDP_HTTP_URL || null,
+    cdpWsUrlConfigured: Boolean(REMOTE_BROWSER_CDP_WS_URL),
+    syncIntervalMs: REMOTE_BROWSER_SYNC_INTERVAL_MS,
+    cookieDomains: REMOTE_BROWSER_COOKIE_DOMAINS,
+    cookieStorePath: REMOTE_BROWSER_COOKIE_STORE_PATH,
+    source: remoteBrowserCookieState.source,
+    cookieCount: remoteBrowserCookieState.cookieCount,
+    hasCookies: remoteBrowserCookieState.cookieCount > 0,
+    lastSyncAt: remoteBrowserCookieState.lastSyncAt,
+    lastSyncOkAt: remoteBrowserCookieState.lastSyncOkAt,
+    lastError: remoteBrowserCookieState.lastError,
+    lastErrorAt: remoteBrowserCookieState.lastErrorAt,
+    syncInProgress: remoteBrowserCookieState.syncInProgress,
+  };
+}
+
+function getRemoteBrowserCookieHealthSummary() {
+  return {
+    enabled: REMOTE_BROWSER_ENABLED,
+    configured: isRemoteBrowserSyncConfigured(),
+    cookieCount: remoteBrowserCookieState.cookieCount,
+    hasCookies: remoteBrowserCookieState.cookieCount > 0,
+    source: remoteBrowserCookieState.source,
+    lastSyncOkAt: remoteBrowserCookieState.lastSyncOkAt,
+    lastError: remoteBrowserCookieState.lastError,
+    syncInProgress: remoteBrowserCookieState.syncInProgress,
+  };
+}
+
+async function loadPersistedRemoteBrowserCookies() {
+  try {
+    const raw = await fs.readFile(REMOTE_BROWSER_COOKIE_STORE_PATH, "utf8");
+    const payload = safeParseJson(raw);
+    const cookies = Array.isArray(payload?.cookies) ? payload.cookies : [];
+
+    setRemoteBrowserCookies(cookies, "persisted_file");
+
+    if (payload?.updatedAt) {
+      remoteBrowserCookieState.lastSyncAt = payload.updatedAt;
+      remoteBrowserCookieState.lastSyncOkAt = payload.updatedAt;
+    }
+  } catch (err) {
+    if (err?.code === "ENOENT") {
+      return;
+    }
+
+    remoteBrowserCookieState.lastError = `读取持久化 Cookie 失败: ${err.message}`;
+    remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
+  }
+}
+
+async function persistRemoteBrowserCookies(cookies = []) {
+  await fs.mkdir(path.dirname(REMOTE_BROWSER_COOKIE_STORE_PATH), {
+    recursive: true,
+  });
+
+  await fs.writeFile(
+    REMOTE_BROWSER_COOKIE_STORE_PATH,
+    JSON.stringify(
+      {
+        updatedAt: new Date().toISOString(),
+        cookieDomains: REMOTE_BROWSER_COOKIE_DOMAINS,
+        cookies,
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
+async function resolveRemoteBrowserCdpWsUrl() {
+  if (REMOTE_BROWSER_CDP_WS_URL) {
+    return REMOTE_BROWSER_CDP_WS_URL;
+  }
+
+  if (!REMOTE_BROWSER_CDP_HTTP_URL) {
+    throw new Error(
+      "未配置 REMOTE_BROWSER_CDP_HTTP_URL 或 REMOTE_BROWSER_CDP_WS_URL"
+    );
+  }
+
+  const response = await requestWithRetry(axios, {
+    method: "GET",
+    url: `${REMOTE_BROWSER_CDP_HTTP_URL}/json/version`,
+    timeout: REMOTE_BROWSER_CDP_TIMEOUT_MS,
+    headers: {
+      ...buildRequestHeaders("english"),
+      Accept: "application/json",
+    },
+  });
+
+  if (response.status >= 400) {
+    throw new Error(`获取远程浏览器调试地址失败: HTTP ${response.status}`);
+  }
+
+  const payload = safeParseJson(response.data);
+  const wsUrl = String(payload?.webSocketDebuggerUrl || "").trim();
+
+  if (!wsUrl) {
+    throw new Error("远程浏览器未暴露 webSocketDebuggerUrl");
+  }
+
+  return wsUrl;
+}
+
+async function callCdp(wsUrl, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const id = Date.now();
+    const socket = new WebSocket(wsUrl, {
+      handshakeTimeout: REMOTE_BROWSER_CDP_TIMEOUT_MS,
+    });
+    let settled = false;
+
+    const finish = (err, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        socket.close();
+      }
+
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      socket.terminate();
+      finish(new Error(`CDP 请求超时: ${method}`));
+    }, REMOTE_BROWSER_CDP_TIMEOUT_MS);
+
+    socket.on("open", () => {
+      socket.send(
+        JSON.stringify({
+          id,
+          method,
+          params,
+        })
+      );
+    });
+
+    socket.on("message", (data) => {
+      let message = null;
+
+      try {
+        message = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+
+      if (message?.id !== id) {
+        return;
+      }
+
+      if (message.error) {
+        finish(new Error(message.error.message || `CDP 调用失败: ${method}`));
+        return;
+      }
+
+      finish(null, message.result || {});
+    });
+
+    socket.on("error", (err) => {
+      finish(err);
+    });
+
+    socket.on("close", (code) => {
+      if (!settled) {
+        finish(new Error(`CDP 连接已关闭: ${code}`));
+      }
+    });
+  });
+}
+
+async function fetchRemoteBrowserCookiesFromCdp() {
+  const wsUrl = await resolveRemoteBrowserCdpWsUrl();
+  const methods = ["Storage.getCookies", "Network.getAllCookies"];
+  const errors = [];
+
+  for (const method of methods) {
+    try {
+      const result = await callCdp(wsUrl, method, {});
+      const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
+
+      return dedupeRemoteBrowserCookies(
+        cookies
+          .map((cookie) => normalizeRemoteBrowserCookie(cookie))
+          .filter(Boolean)
+          .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
+          .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
+      );
+    } catch (err) {
+      errors.push(`${method}: ${err.message}`);
+    }
+  }
+
+  throw new Error(
+    `读取远程浏览器 Cookie 失败。${errors.join("；") || "未拿到任何 Cookie"}`
+  );
+}
+
+async function syncRemoteBrowserCookies() {
+  if (remoteBrowserSyncPromise) {
+    return remoteBrowserSyncPromise;
+  }
+
+  remoteBrowserSyncPromise = (async () => {
+    if (!isRemoteBrowserSyncConfigured()) {
+      throw new Error(
+        "未配置远程浏览器调试地址，请设置 REMOTE_BROWSER_CDP_HTTP_URL 或 REMOTE_BROWSER_CDP_WS_URL"
+      );
+    }
+
+    remoteBrowserCookieState.syncInProgress = true;
+    remoteBrowserCookieState.lastSyncAt = new Date().toISOString();
+
+    const cookies = await fetchRemoteBrowserCookiesFromCdp();
+    setRemoteBrowserCookies(cookies, "remote_browser_cdp");
+    remoteBrowserCookieState.lastSyncOkAt = new Date().toISOString();
+    remoteBrowserCookieState.lastError = null;
+    remoteBrowserCookieState.lastErrorAt = null;
+
+    try {
+      await persistRemoteBrowserCookies(remoteBrowserCookieState.cookies);
+    } catch (err) {
+      remoteBrowserCookieState.lastError = `Cookie 已同步，但写入持久化文件失败: ${err.message}`;
+      remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
+    }
+
+    return {
+      cookieCount: remoteBrowserCookieState.cookieCount,
+      syncedAt: remoteBrowserCookieState.lastSyncOkAt,
+    };
+  })();
+
+  try {
+    return await remoteBrowserSyncPromise;
+  } catch (err) {
+    remoteBrowserCookieState.lastError = err.message;
+    remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
+    throw err;
+  } finally {
+    remoteBrowserCookieState.syncInProgress = false;
+    remoteBrowserSyncPromise = null;
+  }
+}
+
+async function initializeRemoteBrowserCookieSync() {
+  await loadPersistedRemoteBrowserCookies();
+
+  if (!isRemoteBrowserSyncConfigured()) {
+    if (REMOTE_BROWSER_ENABLED) {
+      remoteBrowserCookieState.lastError =
+        "远程浏览器自动同步已开启，但未配置调试地址";
+      remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
+    }
+    return;
+  }
+
+  if (!REMOTE_BROWSER_ENABLED) {
+    return;
+  }
+
+  try {
+    await syncRemoteBrowserCookies();
+  } catch (err) {
+    console.error(`[remote-browser] 初次同步失败: ${err.message}`);
+  }
+
+  remoteBrowserSyncTimer = setInterval(() => {
+    syncRemoteBrowserCookies().catch((err) => {
+      console.error(`[remote-browser] 定时同步失败: ${err.message}`);
+    });
+  }, REMOTE_BROWSER_SYNC_INTERVAL_MS);
+
+  if (typeof remoteBrowserSyncTimer.unref === "function") {
+    remoteBrowserSyncTimer.unref();
+  }
 }
 
 function toAbsoluteStoreUrl(href = "") {
@@ -569,7 +1048,11 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "") {
   const { tags, developers } = extractTags(html);
   const metadata = await fetchLocalizedAppMetadata(client, appid);
 
-  const usedAuthenticatedCookie = Boolean(rawCookieHeader || GLOBAL_STEAM_COOKIE);
+  const usedAuthenticatedCookie = Boolean(
+    rawCookieHeader ||
+      GLOBAL_STEAM_COOKIE ||
+      remoteBrowserCookieState.cookieCount > 0
+  );
 
   return {
     appid: String(appid),
@@ -589,7 +1072,44 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "steam-tags-api",
+    remoteBrowserCookieSync: getRemoteBrowserCookieHealthSummary(),
   });
+});
+
+app.get("/api/steam-cookies/status", (_req, res) => {
+  res.json({
+    success: true,
+    data: getRemoteBrowserCookieStatus(),
+  });
+});
+
+app.post("/api/steam-cookies/sync", async (_req, res) => {
+  if (!isRemoteBrowserSyncConfigured()) {
+    return res.status(400).json({
+      success: false,
+      error: "REMOTE_BROWSER_NOT_CONFIGURED",
+      message:
+        "请先配置 REMOTE_BROWSER_CDP_HTTP_URL 或 REMOTE_BROWSER_CDP_WS_URL",
+    });
+  }
+
+  try {
+    const result = await syncRemoteBrowserCookies();
+
+    return res.json({
+      success: true,
+      data: {
+        ...getRemoteBrowserCookieStatus(),
+        syncedAt: result.syncedAt,
+      },
+    });
+  } catch (err) {
+    return res.status(502).json({
+      success: false,
+      error: "REMOTE_BROWSER_SYNC_FAILED",
+      message: err.message || "远程浏览器 Cookie 同步失败",
+    });
+  }
 });
 
 app.get("/api/app/:appid/tags", async (req, res) => {
@@ -623,7 +1143,7 @@ app.get("/api/app/:appid/tags", async (req, res) => {
         success: false,
         error: "LOGIN_OR_PREFERENCE_REQUIRED",
         message:
-          "这个页面大概率需要登录后的 Steam 账号权限、成熟内容偏好设置，或受地区限制。请传入你自己的 Steam Cookie。",
+          "这个页面大概率需要登录后的 Steam 账号权限、成熟内容偏好设置，或受地区限制。请传入你自己的 Steam Cookie，或开启远程浏览器 Cookie 同步。",
       });
     }
 
@@ -656,6 +1176,15 @@ app.get("/api/app/:appid/tags", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Steam tags API listening on http://127.0.0.1:${PORT}`);
+async function startServer() {
+  await initializeRemoteBrowserCookieSync();
+
+  app.listen(PORT, () => {
+    console.log(`Steam tags API listening on http://127.0.0.1:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error(`Failed to start server: ${err.message}`);
+  process.exit(1);
 });
