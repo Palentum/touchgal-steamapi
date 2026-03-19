@@ -865,12 +865,38 @@ function isAgeGate(html = "", url = "") {
 }
 
 function looksLikeLoginOrPreferenceRestricted(html = "") {
-  return (
-    /sign in/i.test(html) &&
+  const normalizedHtml = String(html || "");
+
+  if (
+    /sign in|login/i.test(normalizedHtml) &&
     /(mature content|store preferences|age assurance|view page|adult|sexual content)/i.test(
-      html
+      normalizedHtml
     )
+  ) {
+    return true;
+  }
+
+  if (
+    /登录|登入|偏好设置|商店偏好|成人内容|成人视频|仅限成年人|查看页面|年龄验证|内容警告/i.test(
+      normalizedHtml
+    )
+  ) {
+    return true;
+  }
+
+  const $ = cheerio.load(normalizedHtml);
+
+  return Boolean(
+    $("#view_product_page_btn").length ||
+      $(".content_warning_ctn").length ||
+      $(".adult_content_under_age").length ||
+      $(".mature_content_notice").length
   );
+}
+
+function scoreSteamResult(result = {}) {
+  return (Array.isArray(result.tags) ? result.tags.length : 0) * 10 +
+    (Array.isArray(result.developers) ? result.developers.length : 0);
 }
 
 function pickSelectValue($, $select, matchers) {
@@ -1237,20 +1263,30 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 
   try {
     const requestHasExplicitCookie = Boolean(requestCookie);
-    let result = await fetchSteamTags(appid, lang, requestCookie, {
+    const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
       useStoredAuthCookies: false,
     });
+    let result = anonymousResult;
 
     const shouldRetryWithStoredAuth =
       !requestHasExplicitCookie &&
       hasStoredAuthCookies() &&
-      result.tags.length === 0 &&
-      looksLikeLoginOrPreferenceRestricted(result.rawHtml);
+      (anonymousResult.tags.length === 0 ||
+        anonymousResult.developers.length === 0 ||
+        looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml));
 
     if (shouldRetryWithStoredAuth) {
-      result = await fetchSteamTags(appid, lang, "", {
+      const authenticatedResult = await fetchSteamTags(appid, lang, "", {
         useStoredAuthCookies: true,
       });
+
+      if (
+        scoreSteamResult(authenticatedResult) > scoreSteamResult(anonymousResult) ||
+        (looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml) &&
+          !looksLikeLoginOrPreferenceRestricted(authenticatedResult.rawHtml))
+      ) {
+        result = authenticatedResult;
+      }
     }
 
     // 明确判断：依然是年龄门
