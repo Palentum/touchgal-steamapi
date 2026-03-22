@@ -1,7 +1,7 @@
 const express = require("express");
 const fs = require("fs/promises");
 const path = require("path");
-const { randomUUID } = require("crypto");
+const { randomUUID, timingSafeEqual } = require("crypto");
 const axios = require("axios");
 const { wrapper } = require("axios-cookiejar-support");
 const { CookieJar, Cookie } = require("tough-cookie");
@@ -14,15 +14,34 @@ const {
 } = require("steam-session");
 
 const app = express();
-app.use(express.json());
-
 const PORT = Number(process.env.PORT || 8765);
+const HOST = String(process.env.HOST || "127.0.0.1").trim() || "127.0.0.1";
 const DEFAULT_LANG = process.env.DEFAULT_LANG || "schinese";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 10000);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
 const RETRY_BASE_DELAY_MS = Number(process.env.RETRY_BASE_DELAY_MS || 800);
 const EMPTY_RESULT_RETRY_DELAY_MS = Number(
   process.env.EMPTY_RESULT_RETRY_DELAY_MS || 1500
+);
+const APP_TAGS_MAX_FETCH_ATTEMPTS = toPositiveInteger(
+  process.env.APP_TAGS_MAX_FETCH_ATTEMPTS,
+  3
+);
+const APP_DETAILS_CACHE_TTL_MS = toPositiveInteger(
+  process.env.APP_DETAILS_CACHE_TTL_MS,
+  10 * 60 * 1000
+);
+const APP_DETAILS_CACHE_MAX_ENTRIES = toPositiveInteger(
+  process.env.APP_DETAILS_CACHE_MAX_ENTRIES,
+  500
+);
+const APP_TAGS_CACHE_TTL_MS = toPositiveInteger(
+  process.env.APP_TAGS_CACHE_TTL_MS,
+  2 * 60 * 1000
+);
+const APP_TAGS_CACHE_MAX_ENTRIES = toPositiveInteger(
+  process.env.APP_TAGS_CACHE_MAX_ENTRIES,
+  500
 );
 const STEAM_SESSION_REFRESH_INTERVAL_MS = Number(
   process.env.STEAM_SESSION_REFRESH_INTERVAL_MS || 30 * 60 * 1000
@@ -40,6 +59,16 @@ const STEAM_SESSION_STORE_PATH = path.resolve(
 const STEAM_SESSION_COOKIE_DOMAINS = parseCsvList(
   process.env.STEAM_SESSION_COOKIE_DOMAINS ||
     "store.steampowered.com,steamcommunity.com,help.steampowered.com"
+);
+const JSON_BODY_LIMIT = String(process.env.JSON_BODY_LIMIT || "16kb").trim() || "16kb";
+const ADMIN_API_KEY = String(process.env.ADMIN_API_KEY || "").trim();
+const ADMIN_ROUTE_WINDOW_MS = toPositiveInteger(
+  process.env.ADMIN_ROUTE_WINDOW_MS,
+  5 * 60 * 1000
+);
+const ADMIN_ROUTE_MAX_REQUESTS = toPositiveInteger(
+  process.env.ADMIN_ROUTE_MAX_REQUESTS,
+  12
 );
 
 // 可选：把你自己浏览器里的 Steam Cookie 整串放到环境变量里。
@@ -84,6 +113,11 @@ const steamCookieState = {
   source: null,
 };
 
+const appDetailsCache = new Map();
+const appDetailsInflightRequests = new Map();
+const appTagResponseCache = new Map();
+const adminRouteBuckets = new Map();
+
 const steamSessionState = {
   refreshToken: "",
   accountName: null,
@@ -100,6 +134,15 @@ const pendingSteamLogins = new Map();
 
 let steamCookieRefreshPromise = null;
 let steamCookieRefreshTimer = null;
+
+app.disable("x-powered-by");
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+app.use((req, res, next) => {
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  next();
+});
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -134,6 +177,150 @@ function parseCsvList(value = "") {
     .map((item) => String(item || "").trim().toLowerCase())
     .filter(Boolean);
 }
+
+function toPositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function cloneJsonValue(value) {
+  if (value == null) {
+    return value;
+  }
+
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getCacheEntry(cache, key) {
+  const entry = cache.get(key);
+  if (!entry) {
+    return null;
+  }
+
+  if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+
+  return cloneJsonValue(entry.value);
+}
+
+function setCacheEntry(cache, key, value, ttlMs, maxEntries) {
+  if (!ttlMs || ttlMs <= 0) {
+    return;
+  }
+
+  const expiresAt = Date.now() + ttlMs;
+  if (cache.has(key)) {
+    cache.delete(key);
+  }
+
+  cache.set(key, {
+    value: cloneJsonValue(value),
+    expiresAt,
+  });
+
+  while (cache.size > maxEntries) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey == null) {
+      break;
+    }
+    cache.delete(oldestKey);
+  }
+}
+
+function safeTimingEqual(expected = "", provided = "") {
+  const expectedBuffer = Buffer.from(String(expected || ""));
+  const providedBuffer = Buffer.from(String(provided || ""));
+
+  if (expectedBuffer.length !== providedBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(expectedBuffer, providedBuffer);
+}
+
+function getRequestIp(req) {
+  return (
+    String(req.ip || "").trim() ||
+    String(req.socket?.remoteAddress || "").trim() ||
+    "unknown"
+  );
+}
+
+function extractApiKey(req) {
+  const authorization = String(req.header("authorization") || "").trim();
+  if (/^Bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^Bearer\s+/i, "").trim();
+  }
+
+  return String(req.header("x-api-key") || "").trim();
+}
+
+function requireAdminAccess(req, res, next) {
+  res.setHeader("Cache-Control", "no-store");
+
+  if (!ADMIN_API_KEY) {
+    return next();
+  }
+
+  if (safeTimingEqual(ADMIN_API_KEY, extractApiKey(req))) {
+    return next();
+  }
+
+  return res.status(401).json({
+    success: false,
+    error: "UNAUTHORIZED",
+    message: "缺少有效的管理接口访问凭证",
+  });
+}
+
+function createRateLimiter({ namespace, windowMs, maxRequests }) {
+  return (req, res, next) => {
+    const now = Date.now();
+
+    for (const [key, timestamps] of adminRouteBuckets.entries()) {
+      const activeTimestamps = timestamps.filter(
+        (timestamp) => now - timestamp < windowMs
+      );
+
+      if (activeTimestamps.length === 0) {
+        adminRouteBuckets.delete(key);
+        continue;
+      }
+
+      adminRouteBuckets.set(key, activeTimestamps);
+    }
+
+    const bucketKey = `${namespace}:${getRequestIp(req)}`;
+    const bucket = adminRouteBuckets.get(bucketKey) || [];
+    const recentTimestamps = bucket.filter((timestamp) => now - timestamp < windowMs);
+
+    recentTimestamps.push(now);
+    adminRouteBuckets.set(bucketKey, recentTimestamps);
+
+    if (recentTimestamps.length > maxRequests) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((windowMs - (now - recentTimestamps[0])) / 1000)
+      );
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+      return res.status(429).json({
+        success: false,
+        error: "RATE_LIMITED",
+        message: `请求过于频繁，请在 ${retryAfterSeconds} 秒后重试`,
+      });
+    }
+
+    next();
+  };
+}
+
+const steamMutationRateLimiter = createRateLimiter({
+  namespace: "steam-admin-mutation",
+  windowMs: ADMIN_ROUTE_WINDOW_MS,
+  maxRequests: ADMIN_ROUTE_MAX_REQUESTS,
+});
 
 function buildRequestHeaders(lang) {
   return {
@@ -615,25 +802,36 @@ async function persistSteamSessionState() {
     recursive: true,
   });
 
+  const serializedState = JSON.stringify(
+    {
+      updatedAt: new Date().toISOString(),
+      accountName: steamSessionState.accountName,
+      steamId: steamSessionState.steamId,
+      refreshToken: steamSessionState.refreshToken,
+      lastAuthenticatedAt: steamSessionState.lastAuthenticatedAt,
+      lastCookieRefreshAt: steamSessionState.lastCookieRefreshAt,
+      lastCookieRefreshOkAt: steamSessionState.lastCookieRefreshOkAt,
+      cookieDomains: STEAM_SESSION_COOKIE_DOMAINS,
+      cookieStrings: steamCookieState.cookieStrings,
+    },
+    null,
+    2
+  );
+
   await fs.writeFile(
     STEAM_SESSION_STORE_PATH,
-    JSON.stringify(
-      {
-        updatedAt: new Date().toISOString(),
-        accountName: steamSessionState.accountName,
-        steamId: steamSessionState.steamId,
-        refreshToken: steamSessionState.refreshToken,
-        lastAuthenticatedAt: steamSessionState.lastAuthenticatedAt,
-        lastCookieRefreshAt: steamSessionState.lastCookieRefreshAt,
-        lastCookieRefreshOkAt: steamSessionState.lastCookieRefreshOkAt,
-        cookieDomains: STEAM_SESSION_COOKIE_DOMAINS,
-        cookieStrings: steamCookieState.cookieStrings,
-      },
-      null,
-      2
-    ),
-    "utf8"
+    serializedState,
+    {
+      encoding: "utf8",
+      mode: 0o600,
+    }
   );
+
+  try {
+    await fs.chmod(STEAM_SESSION_STORE_PATH, 0o600);
+  } catch {
+    // 忽略 chmod 失败，避免非 POSIX 环境下持久化直接报错
+  }
 }
 
 function formatSteamSessionError(err) {
@@ -1266,24 +1464,52 @@ function extractTags(html) {
 }
 
 async function fetchAppDetails(client, appid, lang) {
+  const cacheKey = `${appid}:${lang}`;
+  const cachedEntry = getCacheEntry(appDetailsCache, cacheKey);
+  if (cachedEntry) {
+    return cachedEntry;
+  }
+
+  if (appDetailsInflightRequests.has(cacheKey)) {
+    return appDetailsInflightRequests.get(cacheKey);
+  }
+
   const url = `https://store.steampowered.com/api/appdetails?appids=${encodeURIComponent(
     appid
   )}&l=${encodeURIComponent(lang)}`;
 
-  const response = await requestWithRetry(client, {
-    method: "GET",
-    url,
-    headers: buildRequestHeaders(lang),
-  });
+  const requestPromise = (async () => {
+    const response = await requestWithRetry(client, {
+      method: "GET",
+      url,
+      headers: buildRequestHeaders(lang),
+    });
 
-  const payload = safeParseJson(response.data);
-  const entry = payload?.[String(appid)];
+    const payload = safeParseJson(response.data);
+    const entry = payload?.[String(appid)];
 
-  if (!entry?.success || !entry.data) {
-    return null;
+    if (!entry?.success || !entry.data) {
+      return null;
+    }
+
+    setCacheEntry(
+      appDetailsCache,
+      cacheKey,
+      entry.data,
+      APP_DETAILS_CACHE_TTL_MS,
+      APP_DETAILS_CACHE_MAX_ENTRIES
+    );
+
+    return entry.data;
+  })();
+
+  appDetailsInflightRequests.set(cacheKey, requestPromise);
+
+  try {
+    return await requestPromise;
+  } finally {
+    appDetailsInflightRequests.delete(cacheKey);
   }
-
-  return entry.data;
 }
 
 async function fetchLocalizedAppMetadata(client, appid) {
@@ -1379,7 +1605,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.get("/api/steam-auth/status", (_req, res) => {
+app.get("/api/steam-auth/status", requireAdminAccess, (_req, res) => {
   cleanupExpiredPendingSteamLogins();
   res.json({
     success: true,
@@ -1387,7 +1613,7 @@ app.get("/api/steam-auth/status", (_req, res) => {
   });
 });
 
-app.get("/api/steam-cookies/status", (_req, res) => {
+app.get("/api/steam-cookies/status", requireAdminAccess, (_req, res) => {
   cleanupExpiredPendingSteamLogins();
   res.json({
     success: true,
@@ -1395,40 +1621,45 @@ app.get("/api/steam-cookies/status", (_req, res) => {
   });
 });
 
-app.post("/api/steam-auth/login/start", async (req, res) => {
-  const accountName = String(req.body?.accountName || "").trim();
-  const password = String(req.body?.password || "");
-  const steamGuardCode = String(req.body?.steamGuardCode || "").trim();
+app.post(
+  "/api/steam-auth/login/start",
+  requireAdminAccess,
+  steamMutationRateLimiter,
+  async (req, res) => {
+    const accountName = String(req.body?.accountName || "").trim();
+    const password = String(req.body?.password || "");
+    const steamGuardCode = String(req.body?.steamGuardCode || "").trim();
 
-  if (!accountName || !password) {
-    return res.status(400).json({
-      success: false,
-      error: "INVALID_LOGIN_INPUT",
-      message: "accountName 和 password 不能为空",
-    });
+    if (!accountName || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_LOGIN_INPUT",
+        message: "accountName 和 password 不能为空",
+      });
+    }
+
+    try {
+      const result = await startInteractiveSteamLogin({
+        accountName,
+        password,
+        steamGuardCode,
+      });
+
+      return res.json({
+        success: true,
+        data: result,
+      });
+    } catch (err) {
+      return res.status(401).json({
+        success: false,
+        error: "STEAM_LOGIN_START_FAILED",
+        message: formatSteamSessionError(err),
+      });
+    }
   }
+);
 
-  try {
-    const result = await startInteractiveSteamLogin({
-      accountName,
-      password,
-      steamGuardCode,
-    });
-
-    return res.json({
-      success: true,
-      data: result,
-    });
-  } catch (err) {
-    return res.status(401).json({
-      success: false,
-      error: "STEAM_LOGIN_START_FAILED",
-      message: formatSteamSessionError(err),
-    });
-  }
-});
-
-app.get("/api/steam-auth/login/:loginId", (req, res) => {
+app.get("/api/steam-auth/login/:loginId", requireAdminAccess, (req, res) => {
   cleanupExpiredPendingSteamLogins();
 
   const attempt = pendingSteamLogins.get(String(req.params.loginId || "").trim());
@@ -1446,73 +1677,85 @@ app.get("/api/steam-auth/login/:loginId", (req, res) => {
   });
 });
 
-app.post("/api/steam-auth/login/submit-guard", async (req, res) => {
-  const loginId = String(req.body?.loginId || "").trim();
-  const code = String(req.body?.code || "").trim();
+app.post(
+  "/api/steam-auth/login/submit-guard",
+  requireAdminAccess,
+  steamMutationRateLimiter,
+  async (req, res) => {
+    const loginId = String(req.body?.loginId || "").trim();
+    const code = String(req.body?.code || "").trim();
 
-  if (!loginId || !code) {
-    return res.status(400).json({
-      success: false,
-      error: "INVALID_GUARD_INPUT",
-      message: "loginId 和 code 不能为空",
-    });
-  }
-
-  try {
-    const result = await submitSteamGuardCodeForLogin(loginId, code);
-    if (!result) {
-      return res.status(404).json({
+    if (!loginId || !code) {
+      return res.status(400).json({
         success: false,
-        error: "LOGIN_ATTEMPT_NOT_FOUND",
-        message: "找不到对应的登录会话，可能已过期",
+        error: "INVALID_GUARD_INPUT",
+        message: "loginId 和 code 不能为空",
       });
     }
 
-    return res.json({
-      success: true,
-      data: result,
-    });
-  } catch (err) {
-    return res.status(401).json({
-      success: false,
-      error: "STEAM_GUARD_SUBMIT_FAILED",
-      message: formatSteamSessionError(err),
-    });
-  }
-});
+    try {
+      const result = await submitSteamGuardCodeForLogin(loginId, code);
+      if (!result) {
+        return res.status(404).json({
+          success: false,
+          error: "LOGIN_ATTEMPT_NOT_FOUND",
+          message: "找不到对应的登录会话，可能已过期",
+        });
+      }
 
-app.post("/api/steam-cookies/sync", async (_req, res) => {
-  if (!steamSessionState.refreshToken) {
-    return res.status(400).json({
-      success: false,
-      error: "REFRESH_TOKEN_NOT_FOUND",
-      message: "当前没有可用的 refresh token，请先完成一次交互式登录",
-    });
+      return res.json({
+        success: true,
+        data: result,
+      });
+    } catch (err) {
+      return res.status(401).json({
+        success: false,
+        error: "STEAM_GUARD_SUBMIT_FAILED",
+        message: formatSteamSessionError(err),
+      });
+    }
   }
+);
 
-  try {
-    const result = await refreshSteamSessionCookies();
+app.post(
+  "/api/steam-cookies/sync",
+  requireAdminAccess,
+  steamMutationRateLimiter,
+  async (_req, res) => {
+    if (!steamSessionState.refreshToken) {
+      return res.status(400).json({
+        success: false,
+        error: "REFRESH_TOKEN_NOT_FOUND",
+        message: "当前没有可用的 refresh token，请先完成一次交互式登录",
+      });
+    }
 
-    return res.json({
-      success: true,
-      data: {
-        ...getSteamSessionStatus(),
-        refreshedAt: result.refreshedAt,
-      },
-    });
-  } catch (err) {
-    return res.status(502).json({
-      success: false,
-      error: "STEAM_COOKIE_REFRESH_FAILED",
-      message: formatSteamSessionError(err),
-    });
+    try {
+      const result = await refreshSteamSessionCookies();
+
+      return res.json({
+        success: true,
+        data: {
+          ...getSteamSessionStatus(),
+          refreshedAt: result.refreshedAt,
+        },
+      });
+    } catch (err) {
+      return res.status(502).json({
+        success: false,
+        error: "STEAM_COOKIE_REFRESH_FAILED",
+        message: formatSteamSessionError(err),
+      });
+    }
   }
-});
+);
 
 app.get("/api/app/:appid/tags", async (req, res) => {
   const { appid } = req.params;
   const lang = String(req.query.lang || DEFAULT_LANG).trim();
   const requestCookie = req.header("x-steam-cookie") || "";
+  const requestHasExplicitCookie = Boolean(requestCookie);
+  const appTagCacheKey = `${appid}:${lang}`;
   let requestClosed = false;
 
   req.on("close", () => {
@@ -1528,13 +1771,29 @@ app.get("/api/app/:appid/tags", async (req, res) => {
   }
 
   try {
-    const requestHasExplicitCookie = Boolean(requestCookie);
+    if (!requestHasExplicitCookie) {
+      const cachedPayload = getCacheEntry(appTagResponseCache, appTagCacheKey);
+      if (cachedPayload) {
+        return res.json({
+          success: true,
+          data: cachedPayload,
+          warning: null,
+        });
+      }
+    }
 
-    while (!requestClosed) {
+    let lastResult = null;
+
+    for (
+      let attempt = 1;
+      attempt <= APP_TAGS_MAX_FETCH_ATTEMPTS && !requestClosed;
+      attempt++
+    ) {
       const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
         useStoredAuthCookies: false,
       });
       let result = anonymousResult;
+      lastResult = anonymousResult;
 
       const shouldRetryWithStoredAuth =
         !requestHasExplicitCookie &&
@@ -1555,37 +1814,71 @@ app.get("/api/app/:appid/tags", async (req, res) => {
         ) {
           result = authenticatedResult;
         }
+
+        lastResult = result;
       }
 
       if (requestClosed) {
         return;
       }
 
-      if (isAgeGate(result.rawHtml, result.finalUrl)) {
+      const needsRetry =
+        isAgeGate(result.rawHtml, result.finalUrl) || !hasCompleteTagPayload(result);
+
+      if (needsRetry && attempt < APP_TAGS_MAX_FETCH_ATTEMPTS) {
         await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
         continue;
       }
 
-      if (!hasCompleteTagPayload(result)) {
-        await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
-        continue;
+      if (needsRetry) {
+        break;
+      }
+
+      const payload = {
+        appid: result.appid,
+        name: result.name,
+        aliases: result.aliases,
+        releaseDate: result.releaseDate,
+        tags: result.tags,
+        developers: result.developers,
+      };
+
+      if (!requestHasExplicitCookie) {
+        setCacheEntry(
+          appTagResponseCache,
+          appTagCacheKey,
+          payload,
+          APP_TAGS_CACHE_TTL_MS,
+          APP_TAGS_CACHE_MAX_ENTRIES
+        );
       }
 
       return res.json({
         success: true,
-        data: {
-          appid: result.appid,
-          name: result.name,
-          aliases: result.aliases,
-          releaseDate: result.releaseDate,
-          tags: result.tags,
-          developers: result.developers,
-        },
+        data: payload,
         warning: null,
       });
     }
 
-    return;
+    if (requestClosed) {
+      return;
+    }
+
+    return res.status(504).json({
+      success: false,
+      error: "INCOMPLETE_UPSTREAM_DATA",
+      message: `在 ${APP_TAGS_MAX_FETCH_ATTEMPTS} 次尝试后仍未获取到完整 tags/developers 数据`,
+      data: lastResult
+        ? {
+            appid: lastResult.appid,
+            name: lastResult.name,
+            aliases: lastResult.aliases,
+            releaseDate: lastResult.releaseDate,
+            tags: lastResult.tags,
+            developers: lastResult.developers,
+          }
+        : null,
+    });
   } catch (err) {
     const message =
       err?.response?.status
@@ -1603,8 +1896,8 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 async function startServer() {
   await initializeSteamSessionAuth();
 
-  app.listen(PORT, () => {
-    console.log(`Steam tags API listening on http://127.0.0.1:${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`Steam tags API listening on http://${HOST}:${PORT}`);
   });
 }
 

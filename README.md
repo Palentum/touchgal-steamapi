@@ -22,6 +22,8 @@
 - 默认补齐成熟内容偏好 Cookie
 - 兼容全局 `STEAM_COOKIE` 和单次请求 `X-Steam-Cookie`
 - 内置超时、重试和退避逻辑
+- 内置短期缓存，减少重复抓取和上游压力
+- 敏感管理接口支持 API Key 保护和基础限流
 - 提供健康检查和 Steam 登录状态接口
 
 ## 技术栈
@@ -66,11 +68,17 @@ http://127.0.0.1:8765
 | 变量名 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8765` | 服务监听端口 |
+| `HOST` | `127.0.0.1` | 服务监听地址。默认只监听本机，若暴露到公网建议同时设置 `ADMIN_API_KEY` |
 | `DEFAULT_LANG` | `schinese` | 默认语言，可通过请求参数覆盖 |
 | `REQUEST_TIMEOUT_MS` | `10000` | 单次上游请求超时时间（毫秒） |
 | `MAX_RETRIES` | `3` | 最大重试次数 |
 | `RETRY_BASE_DELAY_MS` | `800` | 重试基础退避时间（毫秒） |
 | `EMPTY_RESULT_RETRY_DELAY_MS` | `1500` | 当 `tags` 或 `developers` 为空时，下一次轮询前的等待时间（毫秒） |
+| `APP_TAGS_MAX_FETCH_ATTEMPTS` | `3` | 单次接口请求最多向上游尝试抓取完整结果的次数，超过后返回 `504` |
+| `APP_DETAILS_CACHE_TTL_MS` | `600000` | Steam `appdetails` 元数据缓存时长（毫秒） |
+| `APP_DETAILS_CACHE_MAX_ENTRIES` | `500` | Steam `appdetails` 元数据缓存最大条目数 |
+| `APP_TAGS_CACHE_TTL_MS` | `120000` | 成功抓取到的标签结果缓存时长（毫秒） |
+| `APP_TAGS_CACHE_MAX_ENTRIES` | `500` | 标签结果缓存最大条目数 |
 | `STEAM_COOKIE` | 空 | 可选，全局 Steam Cookie，优先级低于单次请求头 |
 | `USER_AGENT` | 内置浏览器 UA | 可选，自定义请求头 UA |
 | `STEAM_SESSION_STORE_PATH` | `./steam-session-auth.json` | `refresh token` 和最近一次成功换取的 Cookie 持久化文件 |
@@ -78,6 +86,10 @@ http://127.0.0.1:8765
 | `STEAM_SESSION_LOGIN_TIMEOUT_MS` | `300000` | 单次交互式登录的超时时间（毫秒） |
 | `STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS` | `600000` | 登录会话在内存中保留的时长（毫秒） |
 | `STEAM_SESSION_COOKIE_DOMAINS` | `store.steampowered.com,steamcommunity.com,help.steampowered.com` | 自动映射 Cookie 的域名列表，逗号分隔 |
+| `JSON_BODY_LIMIT` | `16kb` | JSON 请求体大小限制 |
+| `ADMIN_API_KEY` | 空 | 可选。设置后，`/api/steam-auth/*` 和 `/api/steam-cookies/*` 需要 `X-API-Key` 或 `Authorization: Bearer <key>` |
+| `ADMIN_ROUTE_WINDOW_MS` | `300000` | 管理写接口限流窗口（毫秒） |
+| `ADMIN_ROUTE_MAX_REQUESTS` | `12` | 单个客户端在限流窗口内允许访问管理写接口的最大次数 |
 
 示例：
 
@@ -152,6 +164,12 @@ curl http://127.0.0.1:8765/api/steam-auth/login/ef1f07f5-8fd8-48ca-a2c2-6a9d4c51
 - 立即换取一组可用的 Steam Cookie
 - 启动定时刷新 Cookie
 
+如果设置了 `ADMIN_API_KEY`，上面的管理接口请求需要额外携带：
+
+```bash
+-H "X-API-Key: your_admin_key"
+```
+
 ## 接口
 
 ### `GET /health`
@@ -222,7 +240,8 @@ curl -X POST http://127.0.0.1:8765/api/steam-cookies/sync
 
 返回行为：
 
-- 如果 `tags` 或 `developers` 为空，接口会按 `EMPTY_RESULT_RETRY_DELAY_MS` 持续重试，直到两者都拿到非空结果或客户端主动断开连接
+- 如果 `tags` 或 `developers` 为空，接口会按 `EMPTY_RESULT_RETRY_DELAY_MS` 重试，最多重试 `APP_TAGS_MAX_FETCH_ATTEMPTS` 次
+- 如果连续重试后仍拿不到完整结果，接口会返回 `504`，并在 `data` 字段中附带最后一次抓取到的部分数据
 
 请求示例：
 
