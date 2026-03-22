@@ -1,6 +1,7 @@
 const express = require("express");
 const fs = require("fs/promises");
 const path = require("path");
+const dotenv = require("dotenv");
 const { randomUUID, timingSafeEqual } = require("crypto");
 const axios = require("axios");
 const { wrapper } = require("axios-cookiejar-support");
@@ -12,6 +13,16 @@ const {
   EAuthTokenPlatformType,
   ESessionPersistence,
 } = require("steam-session");
+
+const dotenvResult = dotenv.config({
+  path: path.resolve(process.cwd(), ".env"),
+  override: true,
+  quiet: true,
+});
+
+if (dotenvResult.error && dotenvResult.error.code !== "ENOENT") {
+  throw new Error(`加载 .env 文件失败: ${dotenvResult.error.message}`);
+}
 
 const app = express();
 const PORT = Number(process.env.PORT || 8765);

@@ -49,6 +49,7 @@
 
 ```bash
 npm install
+cp .env.example .env
 ```
 
 ## 启动
@@ -57,6 +58,8 @@ npm install
 npm start
 ```
 
+也支持从项目根目录的 `.env` 文件读取环境变量，并且 `.env` 中的值会覆盖系统环境变量与代码默认值。
+
 默认监听地址：
 
 ```text
@@ -64,6 +67,12 @@ http://127.0.0.1:8765
 ```
 
 ## 环境变量
+
+加载顺序：
+
+1. 项目根目录 `.env`
+2. 系统环境变量
+3. 代码内默认值
 
 | 变量名 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -94,9 +103,14 @@ http://127.0.0.1:8765
 示例：
 
 ```bash
-export PORT=8765
-export DEFAULT_LANG=schinese
-export STEAM_SESSION_STORE_PATH=./steam-session-auth.json
+.env
+PORT=8765
+DEFAULT_LANG=schinese
+STEAM_SESSION_STORE_PATH=./steam-session-auth.json
+ADMIN_API_KEY=replace_me
+```
+
+```bash
 npm start
 ```
 
