@@ -1,13 +1,20 @@
 const express = require("express");
 const fs = require("fs/promises");
 const path = require("path");
+const { randomUUID } = require("crypto");
 const axios = require("axios");
 const { wrapper } = require("axios-cookiejar-support");
-const { CookieJar } = require("tough-cookie");
+const { CookieJar, Cookie } = require("tough-cookie");
 const cheerio = require("cheerio");
-const WebSocket = require("ws");
+const {
+  LoginSession,
+  EAuthSessionGuardType,
+  EAuthTokenPlatformType,
+  ESessionPersistence,
+} = require("steam-session");
 
 const app = express();
+app.use(express.json());
 
 const PORT = Number(process.env.PORT || 8765);
 const DEFAULT_LANG = process.env.DEFAULT_LANG || "schinese";
@@ -17,28 +24,21 @@ const RETRY_BASE_DELAY_MS = Number(process.env.RETRY_BASE_DELAY_MS || 800);
 const EMPTY_RESULT_RETRY_DELAY_MS = Number(
   process.env.EMPTY_RESULT_RETRY_DELAY_MS || 1500
 );
-const REMOTE_BROWSER_ENABLED = parseBooleanEnv(
-  process.env.REMOTE_BROWSER_ENABLED || "false"
+const STEAM_SESSION_REFRESH_INTERVAL_MS = Number(
+  process.env.STEAM_SESSION_REFRESH_INTERVAL_MS || 30 * 60 * 1000
 );
-const REMOTE_BROWSER_CDP_HTTP_URL = trimTrailingSlash(
-  process.env.REMOTE_BROWSER_CDP_HTTP_URL || ""
+const STEAM_SESSION_LOGIN_TIMEOUT_MS = Number(
+  process.env.STEAM_SESSION_LOGIN_TIMEOUT_MS || 5 * 60 * 1000
 );
-const REMOTE_BROWSER_CDP_WS_URL = String(
-  process.env.REMOTE_BROWSER_CDP_WS_URL || ""
-).trim();
-const REMOTE_BROWSER_SYNC_INTERVAL_MS = Number(
-  process.env.REMOTE_BROWSER_SYNC_INTERVAL_MS || 60000
+const STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS = Number(
+  process.env.STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS || 10 * 60 * 1000
 );
-const REMOTE_BROWSER_CDP_TIMEOUT_MS = Number(
-  process.env.REMOTE_BROWSER_CDP_TIMEOUT_MS || REQUEST_TIMEOUT_MS
-);
-const REMOTE_BROWSER_COOKIE_STORE_PATH = path.resolve(
+const STEAM_SESSION_STORE_PATH = path.resolve(
   process.cwd(),
-  process.env.REMOTE_BROWSER_COOKIE_STORE_PATH ||
-    "./steam-remote-browser-cookies.json"
+  process.env.STEAM_SESSION_STORE_PATH || "./steam-session-auth.json"
 );
-const REMOTE_BROWSER_COOKIE_DOMAINS = parseCsvList(
-  process.env.REMOTE_BROWSER_COOKIE_DOMAINS ||
+const STEAM_SESSION_COOKIE_DOMAINS = parseCsvList(
+  process.env.STEAM_SESSION_COOKIE_DOMAINS ||
     "store.steampowered.com,steamcommunity.com,help.steampowered.com"
 );
 
@@ -77,24 +77,47 @@ const ENGLISH_MONTH_MAP = {
   december: 12,
 };
 
-const remoteBrowserCookieState = {
+const steamCookieState = {
+  cookieStrings: [],
   cookies: [],
   cookieCount: 0,
-  lastSyncAt: null,
-  lastSyncOkAt: null,
-  lastError: null,
-  lastErrorAt: null,
   source: null,
-  syncInProgress: false,
 };
 
-let remoteBrowserSyncPromise = null;
-let remoteBrowserSyncTimer = null;
-let nextCdpMessageId = 1;
-let preferredCdpCookieFetchStrategy = null;
+const steamSessionState = {
+  refreshToken: "",
+  accountName: null,
+  steamId: null,
+  lastAuthenticatedAt: null,
+  lastCookieRefreshAt: null,
+  lastCookieRefreshOkAt: null,
+  lastError: null,
+  lastErrorAt: null,
+  refreshInProgress: false,
+};
+
+const pendingSteamLogins = new Map();
+
+let steamCookieRefreshPromise = null;
+let steamCookieRefreshTimer = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return {
+    promise,
+    resolve,
+    reject,
+  };
 }
 
 function parseBooleanEnv(value = "") {
@@ -103,12 +126,6 @@ function parseBooleanEnv(value = "") {
       .trim()
       .toLowerCase()
   );
-}
-
-function trimTrailingSlash(value = "") {
-  return String(value || "")
-    .trim()
-    .replace(/\/+$/, "");
 }
 
 function parseCsvList(value = "") {
@@ -203,14 +220,140 @@ function splitCookieHeader(raw = "") {
     .filter((s) => s.includes("="));
 }
 
-async function seedRemoteBrowserCookies(jar) {
-  for (const cookie of remoteBrowserCookieState.cookies) {
-    if (
-      !cookie?.name ||
-      !cookie?.domain ||
-      isExpiredRemoteBrowserCookie(cookie) ||
-      !isAllowedRemoteBrowserCookieDomain(cookie.domain)
-    ) {
+function normalizeCookieDomain(value = "") {
+  return String(value || "")
+    .trim()
+    .replace(/^\./, "")
+    .toLowerCase();
+}
+
+function isAllowedSteamCookieDomain(domain = "") {
+  const normalizedDomain = normalizeCookieDomain(domain);
+  if (!normalizedDomain) return false;
+
+  return STEAM_SESSION_COOKIE_DOMAINS.some(
+    (allowedDomain) =>
+      normalizedDomain === allowedDomain ||
+      normalizedDomain.endsWith(`.${allowedDomain}`)
+  );
+}
+
+function buildNormalizedCookie({
+  name = "",
+  value = "",
+  domain = "",
+  path: cookiePath = "/",
+  secure = false,
+  httpOnly = false,
+  sameSite = null,
+  expires = -1,
+}) {
+  const normalizedDomain = normalizeCookieDomain(domain);
+
+  if (!name || !normalizedDomain || !isAllowedSteamCookieDomain(normalizedDomain)) {
+    return null;
+  }
+
+  return {
+    name: String(name || "").trim(),
+    value: String(value || ""),
+    domain: normalizedDomain,
+    path: String(cookiePath || "/").startsWith("/")
+      ? String(cookiePath || "/")
+      : `/${cookiePath}`,
+    secure: Boolean(secure),
+    httpOnly: Boolean(httpOnly),
+    sameSite: sameSite || null,
+    expires: Number.isFinite(Number(expires)) ? Number(expires) : -1,
+  };
+}
+
+function normalizeSteamSessionCookieString(cookieString = "") {
+  const parsed = Cookie.parse(String(cookieString || ""));
+  if (!parsed?.key) {
+    return [];
+  }
+
+  const expires =
+    parsed.expires instanceof Date && Number.isFinite(parsed.expires.getTime())
+      ? Math.floor(parsed.expires.getTime() / 1000)
+      : -1;
+  const domains = parsed.domain
+    ? [normalizeCookieDomain(parsed.domain)]
+    : STEAM_SESSION_COOKIE_DOMAINS;
+
+  return domains
+    .map((domain) =>
+      buildNormalizedCookie({
+        name: parsed.key,
+        value: parsed.value,
+        domain,
+        path: parsed.path || "/",
+        secure: parsed.secure,
+        httpOnly: parsed.httpOnly,
+        sameSite: parsed.sameSite || null,
+        expires,
+      })
+    )
+    .filter(Boolean);
+}
+
+function dedupeCookies(cookies = []) {
+  const uniqueCookies = new Map();
+
+  for (const cookie of cookies) {
+    const key = [cookie.domain, cookie.path, cookie.name].join("\t");
+    uniqueCookies.set(key, cookie);
+  }
+
+  return [...uniqueCookies.values()];
+}
+
+function isExpiredCookie(cookie = {}) {
+  return (
+    Number.isFinite(cookie.expires) &&
+    cookie.expires > 0 &&
+    cookie.expires * 1000 <= Date.now()
+  );
+}
+
+function serializeCookieForJar(cookie = {}) {
+  let serialized = `${cookie.name}=${cookie.value}; Domain=${cookie.domain}; Path=${
+    cookie.path || "/"
+  }`;
+
+  if (cookie.secure) {
+    serialized += "; Secure";
+  }
+
+  if (cookie.httpOnly) {
+    serialized += "; HttpOnly";
+  }
+
+  if (Number.isFinite(cookie.expires) && cookie.expires > 0) {
+    serialized += `; Expires=${new Date(cookie.expires * 1000).toUTCString()}`;
+  }
+
+  return serialized;
+}
+
+function setManagedSteamCookies(cookieStrings = [], source = null) {
+  const normalizedCookieStrings = [...new Set(cookieStrings.map(String).filter(Boolean))];
+  const normalizedCookies = dedupeCookies(
+    normalizedCookieStrings
+      .flatMap((cookieString) => normalizeSteamSessionCookieString(cookieString))
+      .filter((cookie) => !isExpiredCookie(cookie))
+  );
+
+  steamCookieState.cookieStrings = normalizedCookieStrings;
+  steamCookieState.cookies = normalizedCookies;
+  steamCookieState.cookieCount = normalizedCookies.length;
+  steamCookieState.source = source;
+}
+
+async function seedManagedSteamCookies(jar) {
+  for (const cookie of steamCookieState.cookies) {
+    if (!cookie?.name || !cookie?.domain || isExpiredCookie(cookie)) {
       continue;
     }
 
@@ -226,7 +369,7 @@ async function seedRemoteBrowserCookies(jar) {
 }
 
 function hasStoredAuthCookies() {
-  return Boolean(GLOBAL_STEAM_COOKIE || remoteBrowserCookieState.cookieCount > 0);
+  return Boolean(GLOBAL_STEAM_COOKIE || steamCookieState.cookieCount > 0);
 }
 
 async function seedJar(jar, rawCookieHeader = "", options = {}) {
@@ -234,27 +377,35 @@ async function seedJar(jar, rawCookieHeader = "", options = {}) {
   const baseUrl = "https://store.steampowered.com/";
 
   if (useStoredAuthCookies) {
-    // 全局登录态
     for (const pair of splitCookieHeader(GLOBAL_STEAM_COOKIE)) {
       await jar.setCookie(pair, baseUrl);
     }
 
-    // 远程浏览器同步到本地的登录态
-    await seedRemoteBrowserCookies(jar);
+    await seedManagedSteamCookies(jar);
   }
 
-  // 单次请求登录态，优先级更高
   for (const pair of splitCookieHeader(rawCookieHeader)) {
     await jar.setCookie(pair, baseUrl);
   }
 
-  // 给普通年龄门准备的 cookie
   await jar.setCookie(
     "birthtime=0; Domain=store.steampowered.com; Path=/",
     baseUrl
   );
   await jar.setCookie(
     "lastagecheckage=1-0-1970; Domain=store.steampowered.com; Path=/",
+    baseUrl
+  );
+  await jar.setCookie(
+    "wants_mature_content=1; Domain=store.steampowered.com; Path=/",
+    baseUrl
+  );
+  await jar.setCookie(
+    "wants_mature_content_sex=1; Domain=store.steampowered.com; Path=/",
+    baseUrl
+  );
+  await jar.setCookie(
+    "wants_mature_content_violence=1; Domain=store.steampowered.com; Path=/",
     baseUrl
   );
 }
@@ -354,106 +505,9 @@ function normalizeReleaseDate(value = "") {
   return null;
 }
 
-function normalizeCookieDomain(value = "") {
-  return String(value || "")
-    .trim()
-    .replace(/^\./, "")
-    .toLowerCase();
-}
-
-function isRemoteBrowserSyncConfigured() {
-  return Boolean(REMOTE_BROWSER_CDP_WS_URL || REMOTE_BROWSER_CDP_HTTP_URL);
-}
-
-function isAllowedRemoteBrowserCookieDomain(domain = "") {
-  const normalizedDomain = normalizeCookieDomain(domain);
-  if (!normalizedDomain) return false;
-
-  return REMOTE_BROWSER_COOKIE_DOMAINS.some(
-    (allowedDomain) =>
-      normalizedDomain === allowedDomain ||
-      normalizedDomain.endsWith(`.${allowedDomain}`)
-  );
-}
-
-function normalizeRemoteBrowserCookie(cookie = {}) {
-  const name = String(cookie.name || "").trim();
-  const domain = normalizeCookieDomain(cookie.domain);
-  const pathValue = String(cookie.path || "/").trim() || "/";
-  const expires = Number(cookie.expires);
-
-  if (!name || !domain) {
-    return null;
-  }
-
-  return {
-    name,
-    value: String(cookie.value || ""),
-    domain,
-    path: pathValue.startsWith("/") ? pathValue : `/${pathValue}`,
-    secure: Boolean(cookie.secure),
-    httpOnly: Boolean(cookie.httpOnly),
-    sameSite: cookie.sameSite || null,
-    expires: Number.isFinite(expires) ? expires : -1,
-  };
-}
-
-function dedupeRemoteBrowserCookies(cookies = []) {
-  const uniqueCookies = new Map();
-
-  for (const cookie of cookies) {
-    const key = [cookie.domain, cookie.path, cookie.name].join("\t");
-    uniqueCookies.set(key, cookie);
-  }
-
-  return [...uniqueCookies.values()];
-}
-
-function isExpiredRemoteBrowserCookie(cookie = {}) {
-  return (
-    Number.isFinite(cookie.expires) &&
-    cookie.expires > 0 &&
-    cookie.expires * 1000 <= Date.now()
-  );
-}
-
-function serializeCookieForJar(cookie = {}) {
-  let serialized = `${cookie.name}=${cookie.value}; Domain=${cookie.domain}; Path=${
-    cookie.path || "/"
-  }`;
-
-  if (cookie.secure) {
-    serialized += "; Secure";
-  }
-
-  if (cookie.httpOnly) {
-    serialized += "; HttpOnly";
-  }
-
-  if (Number.isFinite(cookie.expires) && cookie.expires > 0) {
-    serialized += `; Expires=${new Date(cookie.expires * 1000).toUTCString()}`;
-  }
-
-  return serialized;
-}
-
-function setRemoteBrowserCookies(cookies = [], source = null) {
-  const normalizedCookies = dedupeRemoteBrowserCookies(
-    cookies
-      .map((cookie) => normalizeRemoteBrowserCookie(cookie))
-      .filter(Boolean)
-      .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
-      .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
-  );
-
-  remoteBrowserCookieState.cookies = normalizedCookies;
-  remoteBrowserCookieState.cookieCount = normalizedCookies.length;
-  remoteBrowserCookieState.source = source;
-}
-
 function summarizeDomainCookies(domain = "") {
   const normalizedDomain = normalizeCookieDomain(domain);
-  const cookies = remoteBrowserCookieState.cookies.filter(
+  const cookies = steamCookieState.cookies.filter(
     (cookie) => cookie.domain === normalizedDomain
   );
 
@@ -467,98 +521,113 @@ function getStoredCookieDiagnostics() {
   const storeSummary = summarizeDomainCookies("store.steampowered.com");
   const communitySummary = summarizeDomainCookies("steamcommunity.com");
   const storeCookieNames = new Set(storeSummary.names);
+  const communityCookieNames = new Set(communitySummary.names);
 
   return {
     store: {
       count: storeSummary.count,
       hasSessionId: storeCookieNames.has("sessionid"),
       hasSteamLoginSecure: storeCookieNames.has("steamLoginSecure"),
-      hasBirthtime: storeCookieNames.has("birthtime"),
-      hasLastAgeCheckAge: storeCookieNames.has("lastagecheckage"),
-      hasMatureContentPrefs:
-        storeCookieNames.has("wants_mature_content") ||
-        storeCookieNames.has("wants_mature_content_sex") ||
-        storeCookieNames.has("wants_mature_content_violence"),
+      seedsAgeGateCookies: true,
+      seedsMatureContentPrefs: true,
     },
     community: {
       count: communitySummary.count,
-      hasSessionId: new Set(communitySummary.names).has("sessionid"),
-      hasSteamLoginSecure: new Set(communitySummary.names).has(
-        "steamLoginSecure"
-      ),
+      hasSessionId: communityCookieNames.has("sessionid"),
+      hasSteamLoginSecure: communityCookieNames.has("steamLoginSecure"),
     },
   };
 }
 
-function getRemoteBrowserCookieStatus() {
+function getSteamSessionStatus() {
+  const activePendingLogins = [...pendingSteamLogins.values()].filter(
+    (attempt) => !attempt.completed
+  );
+
   return {
-    enabled: REMOTE_BROWSER_ENABLED,
-    configured: isRemoteBrowserSyncConfigured(),
-    cdpHttpUrl: REMOTE_BROWSER_CDP_HTTP_URL || null,
-    cdpWsUrlConfigured: Boolean(REMOTE_BROWSER_CDP_WS_URL),
-    syncIntervalMs: REMOTE_BROWSER_SYNC_INTERVAL_MS,
-    cookieDomains: REMOTE_BROWSER_COOKIE_DOMAINS,
-    cookieStorePath: REMOTE_BROWSER_COOKIE_STORE_PATH,
-    source: remoteBrowserCookieState.source,
-    cookieCount: remoteBrowserCookieState.cookieCount,
-    hasCookies: remoteBrowserCookieState.cookieCount > 0,
-    lastSyncAt: remoteBrowserCookieState.lastSyncAt,
-    lastSyncOkAt: remoteBrowserCookieState.lastSyncOkAt,
-    lastError: remoteBrowserCookieState.lastError,
-    lastErrorAt: remoteBrowserCookieState.lastErrorAt,
-    syncInProgress: remoteBrowserCookieState.syncInProgress,
-    preferredCdpCookieFetchStrategy,
+    provider: "steam-session",
+    storePath: STEAM_SESSION_STORE_PATH,
+    refreshIntervalMs: STEAM_SESSION_REFRESH_INTERVAL_MS,
+    loginTimeoutMs: STEAM_SESSION_LOGIN_TIMEOUT_MS,
+    cookieDomains: STEAM_SESSION_COOKIE_DOMAINS,
+    source: steamCookieState.source,
+    cookieCount: steamCookieState.cookieCount,
+    hasCookies: steamCookieState.cookieCount > 0,
+    hasRefreshToken: Boolean(steamSessionState.refreshToken),
+    accountName: steamSessionState.accountName,
+    steamId: steamSessionState.steamId,
+    lastAuthenticatedAt: steamSessionState.lastAuthenticatedAt,
+    lastCookieRefreshAt: steamSessionState.lastCookieRefreshAt,
+    lastCookieRefreshOkAt: steamSessionState.lastCookieRefreshOkAt,
+    lastError: steamSessionState.lastError,
+    lastErrorAt: steamSessionState.lastErrorAt,
+    refreshInProgress: steamSessionState.refreshInProgress,
+    pendingLoginCount: activePendingLogins.length,
     diagnostics: getStoredCookieDiagnostics(),
   };
 }
 
-function getRemoteBrowserCookieHealthSummary() {
+function getSteamSessionHealthSummary() {
   return {
-    enabled: REMOTE_BROWSER_ENABLED,
-    configured: isRemoteBrowserSyncConfigured(),
-    cookieCount: remoteBrowserCookieState.cookieCount,
-    hasCookies: remoteBrowserCookieState.cookieCount > 0,
-    source: remoteBrowserCookieState.source,
-    lastSyncOkAt: remoteBrowserCookieState.lastSyncOkAt,
-    lastError: remoteBrowserCookieState.lastError,
-    syncInProgress: remoteBrowserCookieState.syncInProgress,
+    provider: "steam-session",
+    hasRefreshToken: Boolean(steamSessionState.refreshToken),
+    cookieCount: steamCookieState.cookieCount,
+    hasCookies: steamCookieState.cookieCount > 0,
+    source: steamCookieState.source,
+    lastCookieRefreshOkAt: steamSessionState.lastCookieRefreshOkAt,
+    lastError: steamSessionState.lastError,
+    refreshInProgress: steamSessionState.refreshInProgress,
+    pendingLoginCount: [...pendingSteamLogins.values()].filter(
+      (attempt) => !attempt.completed
+    ).length,
   };
 }
 
-async function loadPersistedRemoteBrowserCookies() {
+async function loadPersistedSteamSessionState() {
   try {
-    const raw = await fs.readFile(REMOTE_BROWSER_COOKIE_STORE_PATH, "utf8");
+    const raw = await fs.readFile(STEAM_SESSION_STORE_PATH, "utf8");
     const payload = safeParseJson(raw);
-    const cookies = Array.isArray(payload?.cookies) ? payload.cookies : [];
 
-    setRemoteBrowserCookies(cookies, "persisted_file");
+    steamSessionState.refreshToken = String(payload?.refreshToken || "").trim();
+    steamSessionState.accountName = payload?.accountName || null;
+    steamSessionState.steamId = payload?.steamId || null;
+    steamSessionState.lastAuthenticatedAt = payload?.lastAuthenticatedAt || null;
+    steamSessionState.lastCookieRefreshAt = payload?.lastCookieRefreshAt || null;
+    steamSessionState.lastCookieRefreshOkAt =
+      payload?.lastCookieRefreshOkAt || null;
 
-    if (payload?.updatedAt) {
-      remoteBrowserCookieState.lastSyncAt = payload.updatedAt;
-      remoteBrowserCookieState.lastSyncOkAt = payload.updatedAt;
-    }
+    const cookieStrings = Array.isArray(payload?.cookieStrings)
+      ? payload.cookieStrings
+      : [];
+    setManagedSteamCookies(cookieStrings, cookieStrings.length ? "persisted_file" : null);
   } catch (err) {
     if (err?.code === "ENOENT") {
       return;
     }
 
-    remoteBrowserCookieState.lastError = `读取持久化 Cookie 失败: ${err.message}`;
-    remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
+    steamSessionState.lastError = `读取 steam-session 持久化文件失败: ${err.message}`;
+    steamSessionState.lastErrorAt = new Date().toISOString();
   }
 }
 
-async function persistRemoteBrowserCookies(cookies = []) {
-  await fs.mkdir(path.dirname(REMOTE_BROWSER_COOKIE_STORE_PATH), {
+async function persistSteamSessionState() {
+  await fs.mkdir(path.dirname(STEAM_SESSION_STORE_PATH), {
     recursive: true,
   });
 
   await fs.writeFile(
-    REMOTE_BROWSER_COOKIE_STORE_PATH,
+    STEAM_SESSION_STORE_PATH,
     JSON.stringify(
       {
         updatedAt: new Date().toISOString(),
-        cookieDomains: REMOTE_BROWSER_COOKIE_DOMAINS,
-        cookies,
+        accountName: steamSessionState.accountName,
+        steamId: steamSessionState.steamId,
+        refreshToken: steamSessionState.refreshToken,
+        lastAuthenticatedAt: steamSessionState.lastAuthenticatedAt,
+        lastCookieRefreshAt: steamSessionState.lastCookieRefreshAt,
+        lastCookieRefreshOkAt: steamSessionState.lastCookieRefreshOkAt,
+        cookieDomains: STEAM_SESSION_COOKIE_DOMAINS,
+        cookieStrings: steamCookieState.cookieStrings,
       },
       null,
       2
@@ -567,342 +636,365 @@ async function persistRemoteBrowserCookies(cookies = []) {
   );
 }
 
-async function fetchRemoteBrowserJson(pathname) {
-  if (!REMOTE_BROWSER_CDP_HTTP_URL) {
-    throw new Error("未配置 REMOTE_BROWSER_CDP_HTTP_URL");
+function formatSteamSessionError(err) {
+  if (!err) {
+    return "未知 Steam 会话错误";
   }
 
-  const response = await requestWithRetry(axios, {
-    method: "GET",
-    url: `${REMOTE_BROWSER_CDP_HTTP_URL}${pathname}`,
-    timeout: REMOTE_BROWSER_CDP_TIMEOUT_MS,
-    headers: {
-      ...buildRequestHeaders("english"),
-      Accept: "application/json",
-    },
-  });
-
-  if (response.status >= 400) {
-    throw new Error(`读取远程浏览器调试信息失败: HTTP ${response.status}`);
-  }
-
-  const payload = safeParseJson(response.data);
-
-  if (!payload) {
-    throw new Error(`远程浏览器返回了无效 JSON: ${pathname}`);
-  }
-
-  return payload;
+  const message = String(err.message || "Steam 会话操作失败");
+  return Number.isInteger(Number(err.eresult))
+    ? `${message} (EResult ${Number(err.eresult)})`
+    : message;
 }
 
-async function resolveRemoteBrowserCdpWsUrl() {
-  if (REMOTE_BROWSER_CDP_WS_URL) {
-    return REMOTE_BROWSER_CDP_WS_URL;
+function normalizeSteamId(steamId) {
+  if (!steamId) return null;
+
+  if (typeof steamId.getSteamID64 === "function") {
+    return String(steamId.getSteamID64());
   }
 
-  if (!REMOTE_BROWSER_CDP_HTTP_URL) {
-    throw new Error(
-      "未配置 REMOTE_BROWSER_CDP_HTTP_URL 或 REMOTE_BROWSER_CDP_WS_URL"
+  const asText = String(steamId).trim();
+  return asText || null;
+}
+
+function cleanupExpiredPendingSteamLogins() {
+  const now = Date.now();
+
+  for (const [loginId, attempt] of pendingSteamLogins.entries()) {
+    const referenceTime = Date.parse(
+      attempt.completedAt || attempt.errorAt || attempt.updatedAt || attempt.createdAt
     );
-  }
 
-  const payload = await fetchRemoteBrowserJson("/json/version");
-  const wsUrl = String(payload?.webSocketDebuggerUrl || "").trim();
-
-  if (!wsUrl) {
-    throw new Error("远程浏览器未暴露 webSocketDebuggerUrl");
-  }
-
-  return wsUrl;
-}
-
-async function callCdp(wsUrl, method, params = {}) {
-  return new Promise((resolve, reject) => {
-    const id = nextCdpMessageId++;
-    if (nextCdpMessageId > 1000000) {
-      nextCdpMessageId = 1;
+    if (!Number.isFinite(referenceTime)) {
+      continue;
     }
-    const socket = new WebSocket(wsUrl, {
-      handshakeTimeout: REMOTE_BROWSER_CDP_TIMEOUT_MS,
-    });
-    let settled = false;
 
-    const finish = (err, result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
+    if (now - referenceTime < STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS) {
+      continue;
+    }
 
-      if (
-        socket.readyState === WebSocket.OPEN ||
-        socket.readyState === WebSocket.CONNECTING
-      ) {
-        socket.close();
-      }
-
-      if (err) {
-        reject(err);
-        return;
-      }
-
-      resolve(result);
-    };
-
-    const timeout = setTimeout(() => {
-      socket.terminate();
-      finish(new Error(`CDP 请求超时: ${method}`));
-    }, REMOTE_BROWSER_CDP_TIMEOUT_MS);
-
-    socket.on("open", () => {
-      socket.send(
-        JSON.stringify({
-          id,
-          method,
-          params,
-        })
-      );
-    });
-
-    socket.on("message", (data) => {
-      let message = null;
-
+    if (!attempt.completed) {
       try {
-        message = JSON.parse(data.toString());
+        attempt.session.cancelLoginAttempt();
       } catch {
-        return;
+        // 忽略清理阶段的取消失败
       }
-
-      if (message?.id !== id) {
-        return;
-      }
-
-      if (message.error) {
-        finish(new Error(message.error.message || `CDP 调用失败: ${method}`));
-        return;
-      }
-
-      finish(null, message.result || {});
-    });
-
-    socket.on("error", (err) => {
-      finish(err);
-    });
-
-    socket.on("close", (code) => {
-      if (!settled) {
-        finish(new Error(`CDP 连接已关闭: ${code}`));
-      }
-    });
-  });
-}
-
-function pickRemoteBrowserPageTarget(targets = []) {
-  const candidates = targets
-    .filter((target) => target?.type === "page")
-    .filter((target) => String(target?.webSocketDebuggerUrl || "").trim());
-
-  if (!candidates.length) {
-    return null;
-  }
-
-  const preferredTarget = candidates.find((target) => {
-    const targetUrl = String(target?.url || "").trim();
-
-    return REMOTE_BROWSER_COOKIE_DOMAINS.some((domain) =>
-      targetUrl.includes(domain)
-    );
-  });
-
-  return preferredTarget || candidates[0];
-}
-
-async function resolveRemoteBrowserPageTargetWsUrl() {
-  if (!REMOTE_BROWSER_CDP_HTTP_URL) {
-    return null;
-  }
-
-  const targets = await fetchRemoteBrowserJson("/json/list");
-  const target = pickRemoteBrowserPageTarget(
-    Array.isArray(targets) ? targets : []
-  );
-
-  return String(target?.webSocketDebuggerUrl || "").trim() || null;
-}
-
-async function fetchCookiesViaPageTarget(pageWsUrl) {
-  const urls = REMOTE_BROWSER_COOKIE_DOMAINS.map(
-    (domain) => `https://${domain}/`
-  );
-  const methods = [
-    {
-      name: "Network.getCookies(page_target)",
-      execute: () => callCdp(pageWsUrl, "Network.getCookies", { urls }),
-    },
-    {
-      name: "Storage.getCookies(page_target)",
-      execute: () => callCdp(pageWsUrl, "Storage.getCookies", {}),
-    },
-  ];
-  const errors = [];
-
-  for (const method of methods) {
-    try {
-      const result = await method.execute();
-      const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
-
-      return dedupeRemoteBrowserCookies(
-        cookies
-          .map((cookie) => normalizeRemoteBrowserCookie(cookie))
-          .filter(Boolean)
-          .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
-          .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
-      );
-    } catch (err) {
-      errors.push(`${method.name}: ${err.message}`);
     }
-  }
 
-  throw new Error(errors.join("；"));
+    pendingSteamLogins.delete(loginId);
+  }
 }
 
-async function fetchRemoteBrowserCookiesFromCdp() {
-  const errors = [];
-  const strategies = {
-    browser_target: async () => {
-      const wsUrl = await resolveRemoteBrowserCdpWsUrl();
-      const methods = ["Storage.getCookies", "Network.getAllCookies"];
-      const strategyErrors = [];
+function guardTypeName(type) {
+  return EAuthSessionGuardType[type] || String(type);
+}
 
-      for (const method of methods) {
-        try {
-          const result = await callCdp(wsUrl, method, {});
-          const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
+function describeGuardAction(action = {}) {
+  const type = action?.type;
+  const typeName = guardTypeName(type);
+  const detail = action?.detail || null;
 
-          return dedupeRemoteBrowserCookies(
-            cookies
-              .map((cookie) => normalizeRemoteBrowserCookie(cookie))
-              .filter(Boolean)
-              .filter((cookie) => !isExpiredRemoteBrowserCookie(cookie))
-              .filter((cookie) => isAllowedRemoteBrowserCookieDomain(cookie.domain))
-          );
-        } catch (err) {
-          strategyErrors.push(`${method}: ${err.message}`);
-        }
-      }
+  let description = "需要继续完成 Steam 登录验证。";
+  if (type === EAuthSessionGuardType.EmailCode) {
+    description = detail
+      ? `请输入发送到邮箱域名 ${detail} 的验证码。`
+      : "请输入邮箱验证码。";
+  } else if (type === EAuthSessionGuardType.DeviceCode) {
+    description = "请输入 Steam 手机令牌生成的两步验证码。";
+  } else if (type === EAuthSessionGuardType.DeviceConfirmation) {
+    description = "请在 Steam 手机 App 中确认本次登录。";
+  } else if (type === EAuthSessionGuardType.EmailConfirmation) {
+    description = "请在邮件中确认本次登录。";
+  }
 
-      throw new Error(strategyErrors.join("；"));
-    },
-    page_target: async () => {
-      const pageWsUrl = await resolveRemoteBrowserPageTargetWsUrl();
-
-      if (!pageWsUrl) {
-        throw new Error("没有可用的 page target WebSocket");
-      }
-
-      return fetchCookiesViaPageTarget(pageWsUrl);
-    },
+  return {
+    type,
+    typeName,
+    detail,
+    description,
   };
-  const defaultOrder = ["browser_target", "page_target"];
-  const strategyOrder = preferredCdpCookieFetchStrategy
-    ? [
-        preferredCdpCookieFetchStrategy,
-        ...defaultOrder.filter(
-          (name) => name !== preferredCdpCookieFetchStrategy
-        ),
-      ]
-    : defaultOrder;
-
-  for (const strategyName of strategyOrder) {
-    try {
-      const cookies = await strategies[strategyName]();
-      preferredCdpCookieFetchStrategy = strategyName;
-      return cookies;
-    } catch (err) {
-      errors.push(`${strategyName}: ${err.message}`);
-    }
-  }
-
-  throw new Error(
-    `读取远程浏览器 Cookie 失败。${errors.join("；") || "未拿到任何 Cookie"}`
-  );
 }
 
-async function syncRemoteBrowserCookies() {
-  if (remoteBrowserSyncPromise) {
-    return remoteBrowserSyncPromise;
+function serializeLoginAttempt(attempt) {
+  return {
+    loginId: attempt.id,
+    accountName: attempt.accountName,
+    steamId: attempt.steamId,
+    status: attempt.status,
+    actionRequired: attempt.actionRequired,
+    validActions: attempt.validActions.map(describeGuardAction),
+    error: attempt.error,
+    createdAt: attempt.createdAt,
+    updatedAt: attempt.updatedAt,
+    completedAt: attempt.completedAt,
+    authenticatedAt: attempt.authenticatedAt,
+    remoteInteractionAt: attempt.remoteInteractionAt,
+    lastSubmittedGuardAt: attempt.lastSubmittedGuardAt,
+    refreshTokenStored: attempt.refreshTokenStored,
+    cookiesRefreshedAt: attempt.cookiesRefreshedAt,
+  };
+}
+
+function markLoginAttemptCompleted(attempt, status, extra = {}) {
+  if (attempt.completed) {
+    return;
   }
 
-  remoteBrowserSyncPromise = (async () => {
-    if (!isRemoteBrowserSyncConfigured()) {
-      throw new Error(
-        "未配置远程浏览器调试地址，请设置 REMOTE_BROWSER_CDP_HTTP_URL 或 REMOTE_BROWSER_CDP_WS_URL"
-      );
-    }
+  attempt.status = status;
+  attempt.completed = true;
+  attempt.actionRequired = false;
+  attempt.updatedAt = new Date().toISOString();
+  attempt.completedAt = attempt.updatedAt;
+  Object.assign(attempt, extra);
+  attempt.settle.resolve();
+}
 
-    remoteBrowserCookieState.syncInProgress = true;
-    remoteBrowserCookieState.lastSyncAt = new Date().toISOString();
+function attachSteamLoginEventHandlers(attempt) {
+  const { session } = attempt;
 
-    const cookies = await fetchRemoteBrowserCookiesFromCdp();
-    setRemoteBrowserCookies(cookies, "remote_browser_cdp");
-    remoteBrowserCookieState.lastSyncOkAt = new Date().toISOString();
-    remoteBrowserCookieState.lastError = null;
-    remoteBrowserCookieState.lastErrorAt = null;
+  session.on("polling", () => {
+    attempt.status = attempt.actionRequired ? "awaiting_completion" : "polling";
+    attempt.updatedAt = new Date().toISOString();
+  });
+
+  session.on("remoteInteraction", () => {
+    attempt.status = "awaiting_confirmation";
+    attempt.remoteInteractionAt = new Date().toISOString();
+    attempt.updatedAt = attempt.remoteInteractionAt;
+  });
+
+  session.on("timeout", () => {
+    attempt.error = "Steam 登录超时，请重新发起登录。";
+    attempt.errorAt = new Date().toISOString();
+    markLoginAttemptCompleted(attempt, "timed_out", {
+      error: attempt.error,
+    });
+  });
+
+  session.on("authenticated", async () => {
+    const authenticatedAt = new Date().toISOString();
 
     try {
-      await persistRemoteBrowserCookies(remoteBrowserCookieState.cookies);
+      const cookieStrings = await session.getWebCookies();
+      if (!Array.isArray(cookieStrings) || cookieStrings.length === 0) {
+        throw new Error("已拿到 refresh token，但未换取到任何 Cookie");
+      }
+
+      steamSessionState.refreshToken = String(session.refreshToken || "").trim();
+      steamSessionState.accountName = session.accountName || attempt.accountName || null;
+      steamSessionState.steamId = normalizeSteamId(session.steamID) || attempt.steamId;
+      steamSessionState.lastAuthenticatedAt = authenticatedAt;
+      steamSessionState.lastCookieRefreshAt = authenticatedAt;
+      steamSessionState.lastCookieRefreshOkAt = authenticatedAt;
+      steamSessionState.lastError = null;
+      steamSessionState.lastErrorAt = null;
+
+      setManagedSteamCookies(cookieStrings, "steam_session_interactive_login");
+      await persistSteamSessionState();
+      ensureSteamCookieRefreshTimer();
+
+      markLoginAttemptCompleted(attempt, "authenticated", {
+        authenticatedAt,
+        refreshTokenStored: true,
+        cookiesRefreshedAt: authenticatedAt,
+      });
     } catch (err) {
-      remoteBrowserCookieState.lastError = `Cookie 已同步，但写入持久化文件失败: ${err.message}`;
-      remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
+      const message = `登录成功，但换取 Cookie 失败: ${formatSteamSessionError(err)}`;
+      steamSessionState.lastError = message;
+      steamSessionState.lastErrorAt = new Date().toISOString();
+      attempt.error = message;
+      attempt.errorAt = steamSessionState.lastErrorAt;
+      markLoginAttemptCompleted(attempt, "failed", {
+        error: attempt.error,
+      });
     }
+  });
+
+  session.on("error", (err) => {
+    const message = formatSteamSessionError(err);
+    attempt.error = message;
+    attempt.errorAt = new Date().toISOString();
+    markLoginAttemptCompleted(attempt, "failed", {
+      error: message,
+    });
+  });
+}
+
+async function waitForLoginAttemptProgress(attempt, timeoutMs = 1200) {
+  await Promise.race([
+    attempt.settle.promise.catch(() => null),
+    sleep(timeoutMs),
+  ]);
+}
+
+async function startInteractiveSteamLogin({
+  accountName,
+  password,
+  steamGuardCode = "",
+}) {
+  cleanupExpiredPendingSteamLogins();
+
+  const session = new LoginSession(EAuthTokenPlatformType.WebBrowser, {
+    userAgent: DEFAULT_USER_AGENT,
+  });
+  session.loginTimeout = STEAM_SESSION_LOGIN_TIMEOUT_MS;
+
+  const attempt = {
+    id: randomUUID(),
+    session,
+    settle: createDeferred(),
+    accountName: String(accountName || "").trim(),
+    steamId: null,
+    status: "starting",
+    actionRequired: false,
+    validActions: [],
+    error: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    completedAt: null,
+    authenticatedAt: null,
+    errorAt: null,
+    remoteInteractionAt: null,
+    lastSubmittedGuardAt: null,
+    refreshTokenStored: false,
+    cookiesRefreshedAt: null,
+    completed: false,
+  };
+
+  attachSteamLoginEventHandlers(attempt);
+  pendingSteamLogins.set(attempt.id, attempt);
+
+  let startResult;
+
+  try {
+    startResult = await session.startWithCredentials({
+      accountName: attempt.accountName,
+      password: String(password || ""),
+      persistence: ESessionPersistence.Persistent,
+      steamGuardCode: String(steamGuardCode || "").trim() || undefined,
+    });
+  } catch (err) {
+    pendingSteamLogins.delete(attempt.id);
+    throw err;
+  }
+
+  attempt.steamId = normalizeSteamId(session.steamID);
+  attempt.actionRequired = Boolean(startResult?.actionRequired);
+  attempt.validActions = Array.isArray(startResult?.validActions)
+    ? startResult.validActions
+    : [];
+  attempt.status = attempt.actionRequired ? "awaiting_guard" : "polling";
+  attempt.updatedAt = new Date().toISOString();
+
+  await waitForLoginAttemptProgress(attempt);
+
+  return serializeLoginAttempt(attempt);
+}
+
+async function submitSteamGuardCodeForLogin(loginId, code) {
+  cleanupExpiredPendingSteamLogins();
+
+  const attempt = pendingSteamLogins.get(loginId);
+  if (!attempt) {
+    return null;
+  }
+
+  if (attempt.completed) {
+    return serializeLoginAttempt(attempt);
+  }
+
+  await attempt.session.submitSteamGuardCode(String(code || "").trim());
+  attempt.actionRequired = false;
+  attempt.status = "polling";
+  attempt.lastSubmittedGuardAt = new Date().toISOString();
+  attempt.updatedAt = attempt.lastSubmittedGuardAt;
+
+  await waitForLoginAttemptProgress(attempt);
+
+  return serializeLoginAttempt(attempt);
+}
+
+async function refreshSteamSessionCookies() {
+  if (!steamSessionState.refreshToken) {
+    throw new Error("当前没有可用的 refresh token，请先完成一次交互式登录");
+  }
+
+  if (steamCookieRefreshPromise) {
+    return steamCookieRefreshPromise;
+  }
+
+  steamCookieRefreshPromise = (async () => {
+    steamSessionState.refreshInProgress = true;
+    steamSessionState.lastCookieRefreshAt = new Date().toISOString();
+
+    const session = new LoginSession(EAuthTokenPlatformType.WebBrowser, {
+      userAgent: DEFAULT_USER_AGENT,
+    });
+    session.refreshToken = steamSessionState.refreshToken;
+
+    const cookieStrings = await session.getWebCookies();
+    if (!Array.isArray(cookieStrings) || cookieStrings.length === 0) {
+      throw new Error("refresh token 换取 Cookie 失败，未返回任何 Cookie");
+    }
+
+    steamSessionState.steamId =
+      normalizeSteamId(session.steamID) || steamSessionState.steamId;
+    steamSessionState.lastCookieRefreshOkAt = new Date().toISOString();
+    steamSessionState.lastError = null;
+    steamSessionState.lastErrorAt = null;
+
+    setManagedSteamCookies(cookieStrings, "steam_session_refresh_token");
+    await persistSteamSessionState();
 
     return {
-      cookieCount: remoteBrowserCookieState.cookieCount,
-      syncedAt: remoteBrowserCookieState.lastSyncOkAt,
+      cookieCount: steamCookieState.cookieCount,
+      refreshedAt: steamSessionState.lastCookieRefreshOkAt,
     };
   })();
 
   try {
-    return await remoteBrowserSyncPromise;
+    return await steamCookieRefreshPromise;
   } catch (err) {
-    remoteBrowserCookieState.lastError = err.message;
-    remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
+    steamSessionState.lastError = formatSteamSessionError(err);
+    steamSessionState.lastErrorAt = new Date().toISOString();
     throw err;
   } finally {
-    remoteBrowserCookieState.syncInProgress = false;
-    remoteBrowserSyncPromise = null;
+    steamSessionState.refreshInProgress = false;
+    steamCookieRefreshPromise = null;
   }
 }
 
-async function initializeRemoteBrowserCookieSync() {
-  await loadPersistedRemoteBrowserCookies();
-
-  if (!isRemoteBrowserSyncConfigured()) {
-    if (REMOTE_BROWSER_ENABLED) {
-      remoteBrowserCookieState.lastError =
-        "远程浏览器自动同步已开启，但未配置调试地址";
-      remoteBrowserCookieState.lastErrorAt = new Date().toISOString();
-    }
+function ensureSteamCookieRefreshTimer() {
+  if (steamCookieRefreshTimer || !steamSessionState.refreshToken) {
     return;
   }
 
-  if (!REMOTE_BROWSER_ENABLED) {
+  steamCookieRefreshTimer = setInterval(() => {
+    refreshSteamSessionCookies().catch((err) => {
+      console.error(`[steam-session] 定时刷新 Cookie 失败: ${err.message}`);
+    });
+  }, STEAM_SESSION_REFRESH_INTERVAL_MS);
+
+  if (typeof steamCookieRefreshTimer.unref === "function") {
+    steamCookieRefreshTimer.unref();
+  }
+}
+
+async function initializeSteamSessionAuth() {
+  await loadPersistedSteamSessionState();
+
+  if (!steamSessionState.refreshToken) {
     return;
   }
 
   try {
-    await syncRemoteBrowserCookies();
+    await refreshSteamSessionCookies();
   } catch (err) {
-    console.error(`[remote-browser] 初次同步失败: ${err.message}`);
+    console.error(`[steam-session] 初次刷新 Cookie 失败: ${err.message}`);
   }
 
-  remoteBrowserSyncTimer = setInterval(() => {
-    syncRemoteBrowserCookies().catch((err) => {
-      console.error(`[remote-browser] 定时同步失败: ${err.message}`);
-    });
-  }, REMOTE_BROWSER_SYNC_INTERVAL_MS);
-
-  if (typeof remoteBrowserSyncTimer.unref === "function") {
-    remoteBrowserSyncTimer.unref();
-  }
+  ensureSteamCookieRefreshTimer();
 }
 
 function toAbsoluteStoreUrl(href = "") {
@@ -975,28 +1067,6 @@ function hasCompleteTagPayload(result = {}) {
   );
 }
 
-function buildLoginRestrictionMessage() {
-  const diagnostics = getStoredCookieDiagnostics();
-
-  if (
-    remoteBrowserCookieState.cookieCount > 0 &&
-    diagnostics.community.hasSteamLoginSecure &&
-    !diagnostics.store.hasSteamLoginSecure
-  ) {
-    return "当前已同步到 Steam Community 登录态，但看起来还没有 Store 侧登录态。请在远程浏览器里打开 https://store.steampowered.com/ 并确认右上角显示你的账号已登录，然后重新同步 Cookie。";
-  }
-
-  if (
-    remoteBrowserCookieState.cookieCount > 0 &&
-    diagnostics.store.hasSteamLoginSecure &&
-    !diagnostics.store.hasMatureContentPrefs
-  ) {
-    return "当前已同步到 Steam Store 登录态，但缺少商店成人内容偏好 Cookie。请在远程浏览器里打开 Steam 商店偏好设置，勾选成人/仅限成年人内容后重新同步 Cookie。";
-  }
-
-  return "这个页面大概率需要登录后的 Steam 账号权限、成熟内容偏好设置，或受地区限制。请传入你自己的 Steam Cookie，或开启远程浏览器 Cookie 同步。";
-}
-
 function pickSelectValue($, $select, matchers) {
   const options = $select.find("option").toArray();
 
@@ -1034,11 +1104,11 @@ function buildAgeGatePayload($, form) {
       const $selected = $el.find("option[selected]").first();
       const $first = $el.find("option").first();
       payload[name] = String(
-        ($selected.attr("value") ||
+        $selected.attr("value") ||
           $selected.text() ||
           $first.attr("value") ||
           $first.text() ||
-          "")
+          ""
       ).trim();
       return;
     }
@@ -1267,7 +1337,6 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     const ageResult = await passAgeGateIfNeeded(client, appid, lang);
     ageGateHandled = ageResult.handled;
 
-    // 再抓一次真正的 app 页面
     response = await requestWithRetry(client, {
       method: "GET",
       url: appUrl,
@@ -1306,42 +1375,136 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "steam-tags-api",
-    remoteBrowserCookieSync: getRemoteBrowserCookieHealthSummary(),
+    steamSessionAuth: getSteamSessionHealthSummary(),
+  });
+});
+
+app.get("/api/steam-auth/status", (_req, res) => {
+  cleanupExpiredPendingSteamLogins();
+  res.json({
+    success: true,
+    data: getSteamSessionStatus(),
   });
 });
 
 app.get("/api/steam-cookies/status", (_req, res) => {
+  cleanupExpiredPendingSteamLogins();
   res.json({
     success: true,
-    data: getRemoteBrowserCookieStatus(),
+    data: getSteamSessionStatus(),
   });
 });
 
-app.post("/api/steam-cookies/sync", async (_req, res) => {
-  if (!isRemoteBrowserSyncConfigured()) {
+app.post("/api/steam-auth/login/start", async (req, res) => {
+  const accountName = String(req.body?.accountName || "").trim();
+  const password = String(req.body?.password || "");
+  const steamGuardCode = String(req.body?.steamGuardCode || "").trim();
+
+  if (!accountName || !password) {
     return res.status(400).json({
       success: false,
-      error: "REMOTE_BROWSER_NOT_CONFIGURED",
-      message:
-        "请先配置 REMOTE_BROWSER_CDP_HTTP_URL 或 REMOTE_BROWSER_CDP_WS_URL",
+      error: "INVALID_LOGIN_INPUT",
+      message: "accountName 和 password 不能为空",
     });
   }
 
   try {
-    const result = await syncRemoteBrowserCookies();
+    const result = await startInteractiveSteamLogin({
+      accountName,
+      password,
+      steamGuardCode,
+    });
+
+    return res.json({
+      success: true,
+      data: result,
+    });
+  } catch (err) {
+    return res.status(401).json({
+      success: false,
+      error: "STEAM_LOGIN_START_FAILED",
+      message: formatSteamSessionError(err),
+    });
+  }
+});
+
+app.get("/api/steam-auth/login/:loginId", (req, res) => {
+  cleanupExpiredPendingSteamLogins();
+
+  const attempt = pendingSteamLogins.get(String(req.params.loginId || "").trim());
+  if (!attempt) {
+    return res.status(404).json({
+      success: false,
+      error: "LOGIN_ATTEMPT_NOT_FOUND",
+      message: "找不到对应的登录会话，可能已过期",
+    });
+  }
+
+  return res.json({
+    success: true,
+    data: serializeLoginAttempt(attempt),
+  });
+});
+
+app.post("/api/steam-auth/login/submit-guard", async (req, res) => {
+  const loginId = String(req.body?.loginId || "").trim();
+  const code = String(req.body?.code || "").trim();
+
+  if (!loginId || !code) {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_GUARD_INPUT",
+      message: "loginId 和 code 不能为空",
+    });
+  }
+
+  try {
+    const result = await submitSteamGuardCodeForLogin(loginId, code);
+    if (!result) {
+      return res.status(404).json({
+        success: false,
+        error: "LOGIN_ATTEMPT_NOT_FOUND",
+        message: "找不到对应的登录会话，可能已过期",
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: result,
+    });
+  } catch (err) {
+    return res.status(401).json({
+      success: false,
+      error: "STEAM_GUARD_SUBMIT_FAILED",
+      message: formatSteamSessionError(err),
+    });
+  }
+});
+
+app.post("/api/steam-cookies/sync", async (_req, res) => {
+  if (!steamSessionState.refreshToken) {
+    return res.status(400).json({
+      success: false,
+      error: "REFRESH_TOKEN_NOT_FOUND",
+      message: "当前没有可用的 refresh token，请先完成一次交互式登录",
+    });
+  }
+
+  try {
+    const result = await refreshSteamSessionCookies();
 
     return res.json({
       success: true,
       data: {
-        ...getRemoteBrowserCookieStatus(),
-        syncedAt: result.syncedAt,
+        ...getSteamSessionStatus(),
+        refreshedAt: result.refreshedAt,
       },
     });
   } catch (err) {
     return res.status(502).json({
       success: false,
-      error: "REMOTE_BROWSER_SYNC_FAILED",
-      message: err.message || "远程浏览器 Cookie 同步失败",
+      error: "STEAM_COOKIE_REFRESH_FAILED",
+      message: formatSteamSessionError(err),
     });
   }
 });
@@ -1398,7 +1561,6 @@ app.get("/api/app/:appid/tags", async (req, res) => {
         return;
       }
 
-      // 明确判断：依然是年龄门
       if (isAgeGate(result.rawHtml, result.finalUrl)) {
         await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
         continue;
@@ -1439,7 +1601,7 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 });
 
 async function startServer() {
-  await initializeRemoteBrowserCookieSync();
+  await initializeSteamSessionAuth();
 
   app.listen(PORT, () => {
     console.log(`Steam tags API listening on http://127.0.0.1:${PORT}`);
