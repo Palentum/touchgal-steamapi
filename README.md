@@ -40,7 +40,9 @@
 
 ```text
 .
+├── ecosystem.config.js
 ├── package.json
+├── package-lock.json
 ├── server.js
 └── README.md
 ```
@@ -57,6 +59,39 @@ cp .env.example .env
 ```bash
 npm start
 ```
+
+## 使用 PM2 保持运行
+
+项目已内置 `pm2` 和默认配置文件 `ecosystem.config.js`，适合长期运行和开机自启。
+
+首次启动：
+
+```bash
+npm run pm2:start
+```
+
+常用命令：
+
+```bash
+npm run pm2:logs
+npm run pm2:restart
+npm run pm2:reload
+npm run pm2:stop
+npm run pm2:delete
+```
+
+如果你希望机器重启后自动拉起：
+
+```bash
+npm run pm2:save
+npx pm2 startup
+```
+
+说明：
+
+- 进程名固定为 `touchgal-steamapi`
+- `pm2` 以单进程 `fork` 模式运行，避免当前内存缓存和 Steam 会话状态在多实例下出现不一致
+- 服务现在支持接收 `SIGINT` / `SIGTERM` 后优雅退出，`pm2 restart` 或 `pm2 reload` 时会先停止定时刷新任务并关闭 HTTP 服务
 
 也支持从项目根目录的 `.env` 文件读取环境变量，并且 `.env` 中的值会覆盖系统环境变量与代码默认值。
 
@@ -99,6 +134,7 @@ http://127.0.0.1:8765
 | `ADMIN_API_KEY` | 空 | 可选。设置后，`/api/steam-auth/*` 和 `/api/steam-cookies/*` 需要 `X-API-Key` 或 `Authorization: Bearer <key>` |
 | `ADMIN_ROUTE_WINDOW_MS` | `300000` | 管理写接口限流窗口（毫秒） |
 | `ADMIN_ROUTE_MAX_REQUESTS` | `12` | 单个客户端在限流窗口内允许访问管理写接口的最大次数 |
+| `SHUTDOWN_TIMEOUT_MS` | `10000` | 进程收到退出信号后的优雅停机等待时间（毫秒），超过后会强制断开剩余连接 |
 
 示例：
 

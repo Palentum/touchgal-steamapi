@@ -81,6 +81,10 @@ const ADMIN_ROUTE_MAX_REQUESTS = toPositiveInteger(
   process.env.ADMIN_ROUTE_MAX_REQUESTS,
   12
 );
+const SHUTDOWN_TIMEOUT_MS = toPositiveInteger(
+  process.env.SHUTDOWN_TIMEOUT_MS,
+  10000
+);
 
 // 可选：把你自己浏览器里的 Steam Cookie 整串放到环境变量里。
 // 也可以每次请求时通过 X-Steam-Cookie 请求头单独传入。
@@ -145,6 +149,8 @@ const pendingSteamLogins = new Map();
 
 let steamCookieRefreshPromise = null;
 let steamCookieRefreshTimer = null;
+let server = null;
+let isShuttingDown = false;
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
@@ -1190,6 +1196,29 @@ function ensureSteamCookieRefreshTimer() {
   }
 }
 
+function stopSteamCookieRefreshTimer() {
+  if (!steamCookieRefreshTimer) {
+    return;
+  }
+
+  clearInterval(steamCookieRefreshTimer);
+  steamCookieRefreshTimer = null;
+}
+
+function cancelPendingSteamLogins() {
+  for (const attempt of pendingSteamLogins.values()) {
+    if (attempt.completed) {
+      continue;
+    }
+
+    try {
+      attempt.session.cancelLoginAttempt();
+    } catch {
+      // 忽略停机阶段的会话取消失败
+    }
+  }
+}
+
 async function initializeSteamSessionAuth() {
   await loadPersistedSteamSessionState();
 
@@ -1907,12 +1936,71 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 async function startServer() {
   await initializeSteamSessionAuth();
 
-  app.listen(PORT, HOST, () => {
-    console.log(`Steam tags API listening on http://${HOST}:${PORT}`);
+  server = await new Promise((resolve, reject) => {
+    const instance = app.listen(PORT, HOST, () => {
+      console.log(`Steam tags API listening on http://${HOST}:${PORT}`);
+      resolve(instance);
+    });
+
+    instance.on("error", reject);
   });
+}
+
+async function shutdown(signal) {
+  if (isShuttingDown) {
+    return;
+  }
+
+  isShuttingDown = true;
+  console.log(`Received ${signal}, shutting down gracefully...`);
+  stopSteamCookieRefreshTimer();
+  cancelPendingSteamLogins();
+
+  if (!server) {
+    process.exit(0);
+    return;
+  }
+
+  const shutdownTimer = setTimeout(() => {
+    if (typeof server.closeAllConnections === "function") {
+      server.closeAllConnections();
+    }
+  }, SHUTDOWN_TIMEOUT_MS);
+
+  if (typeof shutdownTimer.unref === "function") {
+    shutdownTimer.unref();
+  }
+
+  try {
+    await new Promise((resolve, reject) => {
+      server.close((err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+
+        resolve();
+      });
+    });
+
+    clearTimeout(shutdownTimer);
+    process.exit(0);
+  } catch (err) {
+    clearTimeout(shutdownTimer);
+    console.error(`Graceful shutdown failed: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 startServer().catch((err) => {
   console.error(`Failed to start server: ${err.message}`);
   process.exit(1);
+});
+
+process.on("SIGINT", () => {
+  shutdown("SIGINT");
+});
+
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM");
 });
