@@ -1,3 +1,12 @@
 node_modules/
 .env
 steam-session-auth.json
+
+# Claude Code 本地工作区（不入库）
+CLAUDE.md
+.claude/
+docs/
+
+# IDE / OS 噪音
+.idea/
+.DS_Store

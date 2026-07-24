@@ -7,6 +7,8 @@ const axios = require("axios");
 const { wrapper } = require("axios-cookiejar-support");
 const { CookieJar, Cookie } = require("tough-cookie");
 const cheerio = require("cheerio");
+const { SocksProxyAgent } = require("socks-proxy-agent");
+const { createCookieAgent } = require("http-cookie-agent/http");
 const {
   LoginSession,
   EAuthSessionGuardType,
@@ -93,6 +95,35 @@ const GLOBAL_STEAM_COOKIE = process.env.STEAM_COOKIE || "";
 const DEFAULT_USER_AGENT =
   process.env.USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+
+// 可选：所有对外请求（Steam 商店抓取 + steam-session 登录/刷新）走 SOCKS5 代理。
+// 格式：socks5://user:pass@host:port 或 socks5h://host:port（socks5h 由代理端解析域名）。
+const SOCKS5_PROXY_URL = parseSocks5ProxyUrl(process.env.SOCKS5_PROXY_URL);
+// axios-cookiejar-support 的 wrapper 不允许外部 Agent，代理模式下改用
+// http-cookie-agent（wrapper 的底层实现）直接组合出 cookie + SOCKS5 的 Agent。
+const SocksCookieAgent = createCookieAgent(SocksProxyAgent);
+
+function parseSocks5ProxyUrl(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`SOCKS5_PROXY_URL 不是合法的 URL: ${raw}`);
+  }
+
+  if (!["socks5:", "socks5h:"].includes(parsed.protocol) || !parsed.hostname) {
+    throw new Error(
+      `SOCKS5_PROXY_URL 必须是 socks5:// 或 socks5h:// 开头且包含主机名: ${raw}`
+    );
+  }
+
+  return raw;
+}
 
 const ENGLISH_MONTH_MAP = {
   jan: 1,
@@ -615,6 +646,21 @@ async function seedJar(jar, rawCookieHeader = "", options = {}) {
 }
 
 function createClient(jar) {
+  if (SOCKS5_PROXY_URL) {
+    const proxyCookieAgent = new SocksCookieAgent(SOCKS5_PROXY_URL, {
+      cookies: { jar },
+    });
+
+    return axios.create({
+      withCredentials: true,
+      maxRedirects: 5,
+      decompress: true,
+      httpAgent: proxyCookieAgent,
+      httpsAgent: proxyCookieAgent,
+      proxy: false,
+    });
+  }
+
   return wrapper(
     axios.create({
       jar,
@@ -1052,6 +1098,7 @@ async function startInteractiveSteamLogin({
 
   const session = new LoginSession(EAuthTokenPlatformType.WebBrowser, {
     userAgent: DEFAULT_USER_AGENT,
+    ...(SOCKS5_PROXY_URL ? { socksProxy: SOCKS5_PROXY_URL } : {}),
   });
   session.loginTimeout = STEAM_SESSION_LOGIN_TIMEOUT_MS;
 
@@ -1145,6 +1192,7 @@ async function refreshSteamSessionCookies() {
 
     const session = new LoginSession(EAuthTokenPlatformType.WebBrowser, {
       userAgent: DEFAULT_USER_AGENT,
+      ...(SOCKS5_PROXY_URL ? { socksProxy: SOCKS5_PROXY_URL } : {}),
     });
     session.refreshToken = steamSessionState.refreshToken;
 
@@ -1934,6 +1982,12 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 });
 
 async function startServer() {
+  if (SOCKS5_PROXY_URL) {
+    console.log(
+      `[proxy] 对外请求已启用 SOCKS5 代理: ${new URL(SOCKS5_PROXY_URL).host}`
+    );
+  }
+
   await initializeSteamSessionAuth();
 
   server = await new Promise((resolve, reject) => {
