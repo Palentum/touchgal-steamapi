@@ -53,6 +53,13 @@ const STEAM_SESSION_REFRESH_INTERVAL_MS = envInt(
   "STEAM_SESSION_REFRESH_INTERVAL_MS",
   30 * 60 * 1000
 );
+// getWebCookies 底层（steam-session → stdlib HttpClient）没有任何超时，
+// 上游停滞时 promise 永不 settle，会永久卡死刷新去重并阻塞后续刷新。
+// 默认 45s：高于 socks 库 30s 的握手兜底，能区分代理拒连和真挂起。
+const STEAM_SESSION_COOKIE_TIMEOUT_MS = envInt(
+  "STEAM_SESSION_COOKIE_TIMEOUT_MS",
+  45 * 1000
+);
 const STEAM_SESSION_LOGIN_TIMEOUT_MS = envInt(
   "STEAM_SESSION_LOGIN_TIMEOUT_MS",
   5 * 60 * 1000
@@ -1272,7 +1279,16 @@ async function refreshSteamSessionCookies() {
     });
     session.refreshToken = steamSessionState.refreshToken;
 
-    const cookieStrings = await session.getWebCookies();
+    // LoginSession 无 abort API：超时只放弃等待，挂死的底层请求交 OS 回收
+    const cookieStrings = await Promise.race([
+      session.getWebCookies(),
+      sleep(STEAM_SESSION_COOKIE_TIMEOUT_MS).then(() => {
+        throw new Error(
+          `refresh token 换取 Cookie 超时（超过 ${STEAM_SESSION_COOKIE_TIMEOUT_MS}ms），已放弃本次刷新`
+        );
+      }),
+    ]);
+
     if (!Array.isArray(cookieStrings) || cookieStrings.length === 0) {
       throw new Error("refresh token 换取 Cookie 失败，未返回任何 Cookie");
     }
@@ -1343,18 +1359,16 @@ function cancelPendingSteamLogins() {
   }
 }
 
-async function initializeSteamSessionAuth() {
-  await loadPersistedSteamSessionState();
-
+// 首刷 + 定时器涉及上游网络，必须放在端口绑定之后后台执行：
+// 上游挂起时不能阻塞 app.listen（/health 和匿名抓取不依赖登录态）。
+function startSteamSessionCookieRefresh() {
   if (!steamSessionState.refreshToken) {
     return;
   }
 
-  try {
-    await refreshSteamSessionCookies();
-  } catch (err) {
+  refreshSteamSessionCookies().catch((err) => {
     console.error(`[steam-session] 初次刷新 Cookie 失败: ${err.message}`);
-  }
+  });
 
   ensureSteamCookieRefreshTimer();
 }
@@ -2159,7 +2173,8 @@ async function startServer() {
     );
   }
 
-  await initializeSteamSessionAuth();
+  // listen 前先加载本地登录态（无网络），保证 status 端点启动即准确
+  await loadPersistedSteamSessionState();
 
   server = await new Promise((resolve, reject) => {
     const instance = app.listen(PORT, HOST, () => {
@@ -2169,6 +2184,8 @@ async function startServer() {
 
     instance.on("error", reject);
   });
+
+  startSteamSessionCookieRefresh();
 }
 
 async function shutdown(signal) {

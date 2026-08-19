@@ -129,6 +129,7 @@ http://127.0.0.1:8765
 | `SOCKS5_PROXY_URL` | 空 | 可选。设置后所有对外请求（商店页抓取、`appdetails`、steam-session 登录/刷新）都经由该 SOCKS5 代理发出。格式 `socks5://user:pass@host:port` 或 `socks5h://host:port`（`socks5h` 表示域名也交给代理端解析） |
 | `STEAM_SESSION_STORE_PATH` | `./steam-session-auth.json` | `refresh token` 和最近一次成功换取的 Cookie 持久化文件 |
 | `STEAM_SESSION_REFRESH_INTERVAL_MS` | `1800000` | 定时用 `refresh token` 刷新 Cookie 的间隔（毫秒） |
+| `STEAM_SESSION_COOKIE_TIMEOUT_MS` | `45000` | 单次用 `refresh token` 换取 Cookie 的超时时间（毫秒），防止上游停滞时刷新永久挂起 |
 | `STEAM_SESSION_LOGIN_TIMEOUT_MS` | `300000` | 单次交互式登录的超时时间（毫秒） |
 | `STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS` | `600000` | 登录会话在内存中保留的时长（毫秒） |
 | `STEAM_SESSION_COOKIE_DOMAINS` | `store.steampowered.com,steamcommunity.com,help.steampowered.com` | 自动映射 Cookie 的域名列表，逗号分隔 |
