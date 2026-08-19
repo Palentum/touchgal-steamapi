@@ -123,6 +123,7 @@ http://127.0.0.1:8765
 | `APP_DETAILS_CACHE_MAX_ENTRIES` | `500` | Steam `appdetails` 元数据缓存最大条目数 |
 | `APP_TAGS_CACHE_TTL_MS` | `120000` | 成功抓取到的标签结果缓存时长（毫秒） |
 | `APP_TAGS_CACHE_MAX_ENTRIES` | `500` | 标签结果缓存最大条目数 |
+| `APP_TAGS_NEGATIVE_CACHE_TTL_MS` | `60000` | 失败结果的负缓存时长（毫秒）：`504` 不完整结果和 `appdetails` 查无此 app 的结果在此期间直接返回缓存，不再触发上游抓取 |
 | `STEAM_COOKIE` | 空 | 可选，全局 Steam Cookie，优先级低于单次请求头 |
 | `USER_AGENT` | 内置浏览器 UA | 可选，自定义请求头 UA |
 | `SOCKS5_PROXY_URL` | 空 | 可选。设置后所有对外请求（商店页抓取、`appdetails`、steam-session 登录/刷新）都经由该 SOCKS5 代理发出。格式 `socks5://user:pass@host:port` 或 `socks5h://host:port`（`socks5h` 表示域名也交给代理端解析） |
@@ -135,6 +136,8 @@ http://127.0.0.1:8765
 | `ADMIN_API_KEY` | 空 | **启用管理接口的必要条件**。`/api/steam-auth/*` 和 `/api/steam-cookies/*` 需要 `X-API-Key` 或 `Authorization: Bearer <key>`。未配置、使用占位值（如 `replace_me`）或长度不足 16 位时，这些接口一律返回 `403`，交互式登录不可用（不影响 `/api/app/:appid/tags`）。建议用 `openssl rand -hex 32` 生成 |
 | `ADMIN_ROUTE_WINDOW_MS` | `300000` | 管理写接口限流窗口（毫秒） |
 | `ADMIN_ROUTE_MAX_REQUESTS` | `12` | 单个客户端在限流窗口内允许访问管理写接口的最大次数 |
+| `PUBLIC_ROUTE_WINDOW_MS` | `60000` | 公开接口 `/api/app/:appid/tags` 的限流窗口（毫秒） |
+| `PUBLIC_ROUTE_MAX_REQUESTS` | `30` | 单个客户端在限流窗口内允许访问公开接口的最大次数，超过返回 `429` |
 | `TRUST_PROXY` | 空（不信任） | 部署在 Nginx 等反代后面时必填，否则 `req.ip` 恒为反代地址、上面的限流会退化成所有调用者共用一个桶。取值：数字表示信任的反代跳数（单层反代填 `1`）、`true` 表示全信任、也接受 IP / CIDR / `loopback` 等 Express 预设名 |
 | `SHUTDOWN_TIMEOUT_MS` | `10000` | 进程收到退出信号后的优雅停机等待时间（毫秒），超过后会强制断开剩余连接 |
 

@@ -56,6 +56,12 @@ const APP_TAGS_CACHE_MAX_ENTRIES = toPositiveInteger(
   process.env.APP_TAGS_CACHE_MAX_ENTRIES,
   500
 );
+// 失败结果（504 不完整数据、appdetails 查无此 app）的短 TTL 负缓存，
+// 用来压制无效 appid 反复触发全量上游抓取的放大攻击面。
+const APP_TAGS_NEGATIVE_CACHE_TTL_MS = toPositiveInteger(
+  process.env.APP_TAGS_NEGATIVE_CACHE_TTL_MS,
+  60 * 1000
+);
 const STEAM_SESSION_REFRESH_INTERVAL_MS = Number(
   process.env.STEAM_SESSION_REFRESH_INTERVAL_MS || 30 * 60 * 1000
 );
@@ -90,6 +96,14 @@ const ADMIN_ROUTE_WINDOW_MS = toPositiveInteger(
 const ADMIN_ROUTE_MAX_REQUESTS = toPositiveInteger(
   process.env.ADMIN_ROUTE_MAX_REQUESTS,
   12
+);
+const PUBLIC_ROUTE_WINDOW_MS = toPositiveInteger(
+  process.env.PUBLIC_ROUTE_WINDOW_MS,
+  60 * 1000
+);
+const PUBLIC_ROUTE_MAX_REQUESTS = toPositiveInteger(
+  process.env.PUBLIC_ROUTE_MAX_REQUESTS,
+  30
 );
 // 部署在反代后面时必须配置，否则 req.ip 恒为反代地址，管理写接口的限流会退化成全局共用一个桶。
 const TRUST_PROXY_SETTING = resolveTrustProxySetting(process.env.TRUST_PROXY);
@@ -172,7 +186,9 @@ const steamCookieState = {
 const appDetailsCache = new Map();
 const appDetailsInflightRequests = new Map();
 const appTagResponseCache = new Map();
+const appTagInflightRequests = new Map();
 const adminRouteBuckets = new Map();
+const publicRouteBuckets = new Map();
 
 const steamSessionState = {
   refreshToken: "",
@@ -373,29 +389,38 @@ function requireAdminAccess(req, res, next) {
   });
 }
 
-function createRateLimiter({ namespace, windowMs, maxRequests }) {
-  return (req, res, next) => {
+function createRateLimiter({ namespace, windowMs, maxRequests, buckets }) {
+  // 过期桶的全量清扫放定时器里做，请求路径只碰自己的桶——
+  // 公开高频端点不能为 O(所有桶) 的扫描买单。
+  const cleanupTimer = setInterval(() => {
     const now = Date.now();
 
-    for (const [key, timestamps] of adminRouteBuckets.entries()) {
+    for (const [key, timestamps] of buckets.entries()) {
       const activeTimestamps = timestamps.filter(
         (timestamp) => now - timestamp < windowMs
       );
 
       if (activeTimestamps.length === 0) {
-        adminRouteBuckets.delete(key);
+        buckets.delete(key);
         continue;
       }
 
-      adminRouteBuckets.set(key, activeTimestamps);
+      buckets.set(key, activeTimestamps);
     }
+  }, windowMs);
 
+  if (typeof cleanupTimer.unref === "function") {
+    cleanupTimer.unref();
+  }
+
+  return (req, res, next) => {
+    const now = Date.now();
     const bucketKey = `${namespace}:${getRequestIp(req)}`;
-    const bucket = adminRouteBuckets.get(bucketKey) || [];
+    const bucket = buckets.get(bucketKey) || [];
     const recentTimestamps = bucket.filter((timestamp) => now - timestamp < windowMs);
 
     recentTimestamps.push(now);
-    adminRouteBuckets.set(bucketKey, recentTimestamps);
+    buckets.set(bucketKey, recentTimestamps);
 
     if (recentTimestamps.length > maxRequests) {
       const retryAfterSeconds = Math.max(
@@ -418,6 +443,14 @@ const steamMutationRateLimiter = createRateLimiter({
   namespace: "steam-admin-mutation",
   windowMs: ADMIN_ROUTE_WINDOW_MS,
   maxRequests: ADMIN_ROUTE_MAX_REQUESTS,
+  buckets: adminRouteBuckets,
+});
+
+const publicTagsRateLimiter = createRateLimiter({
+  namespace: "public-app-tags",
+  windowMs: PUBLIC_ROUTE_WINDOW_MS,
+  maxRequests: PUBLIC_ROUTE_MAX_REQUESTS,
+  buckets: publicRouteBuckets,
 });
 
 function buildRequestHeaders(lang) {
@@ -1592,7 +1625,7 @@ async function fetchAppDetails(client, appid, lang) {
   const cacheKey = `${appid}:${lang}`;
   const cachedEntry = getCacheEntry(appDetailsCache, cacheKey);
   if (cachedEntry) {
-    return cachedEntry;
+    return cachedEntry.missing ? null : cachedEntry;
   }
 
   if (appDetailsInflightRequests.has(cacheKey)) {
@@ -1614,6 +1647,15 @@ async function fetchAppDetails(client, appid, lang) {
     const entry = payload?.[String(appid)];
 
     if (!entry?.success || !entry.data) {
+      // 查无此 app 也要短暂缓存（哨兵 { missing: true }，缓存值为 null 会被
+      // getCacheEntry 当未命中）：否则无效 appid 的每轮重试都会重发全部 appdetails 请求。
+      setCacheEntry(
+        appDetailsCache,
+        cacheKey,
+        { missing: true },
+        APP_TAGS_NEGATIVE_CACHE_TTL_MS,
+        APP_DETAILS_CACHE_MAX_ENTRIES
+      );
       return null;
     }
 
@@ -1719,6 +1761,108 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     ageGateHandled,
     usedAuthenticatedCookie,
     rawHtml: html,
+  };
+}
+
+function buildAppTagPayload(result) {
+  return {
+    appid: result.appid,
+    name: result.name,
+    aliases: result.aliases,
+    releaseDate: result.releaseDate,
+    tags: result.tags,
+    developers: result.developers,
+  };
+}
+
+function sendIncompleteTagsResponse(res, payload) {
+  return res.status(504).json({
+    success: false,
+    error: "INCOMPLETE_UPSTREAM_DATA",
+    message: `在 ${APP_TAGS_MAX_FETCH_ATTEMPTS} 次尝试后仍未获取到完整 tags/developers 数据`,
+    data: payload,
+  });
+}
+
+// 完整跑一轮抓取循环：匿名优先、必要时用托管 Cookie 重抓、最多 APP_TAGS_MAX_FETCH_ATTEMPTS 次。
+// 无显式 Cookie 的请求会按 appid:lang 共享同一个在途任务，因此本函数不感知单个请求的
+// 连接状态；shouldAbort 仅供携带显式 X-Steam-Cookie、不参与共享的请求做断开提前中止。
+async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}) {
+  const { shouldAbort = () => false } = options;
+  const requestHasExplicitCookie = Boolean(requestCookie);
+  let lastResult = null;
+
+  for (
+    let attempt = 1;
+    attempt <= APP_TAGS_MAX_FETCH_ATTEMPTS && !shouldAbort();
+    attempt++
+  ) {
+    const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
+      useStoredAuthCookies: false,
+    });
+    let result = anonymousResult;
+    lastResult = anonymousResult;
+
+    const shouldRetryWithStoredAuth =
+      !requestHasExplicitCookie &&
+      hasStoredAuthCookies() &&
+      (anonymousResult.tags.length === 0 ||
+        anonymousResult.developers.length === 0 ||
+        looksLikeLoginOrPreferenceRestricted(
+          anonymousResult.rawHtml,
+          anonymousResult.finalUrl
+        ));
+
+    if (shouldRetryWithStoredAuth) {
+      const authenticatedResult = await fetchSteamTags(appid, lang, "", {
+        useStoredAuthCookies: true,
+      });
+
+      if (
+        scoreSteamResult(authenticatedResult) > scoreSteamResult(anonymousResult) ||
+        (hasCompleteTagPayload(authenticatedResult) &&
+          looksLikeLoginOrPreferenceRestricted(
+            anonymousResult.rawHtml,
+            anonymousResult.finalUrl
+          ) &&
+          !looksLikeLoginOrPreferenceRestricted(
+            authenticatedResult.rawHtml,
+            authenticatedResult.finalUrl
+          ))
+      ) {
+        result = authenticatedResult;
+      }
+
+      lastResult = result;
+    }
+
+    if (shouldAbort()) {
+      return { aborted: true, complete: false, payload: null };
+    }
+
+    const needsRetry =
+      isAgeGate(result.rawHtml, result.finalUrl) || !hasCompleteTagPayload(result);
+
+    if (needsRetry && attempt < APP_TAGS_MAX_FETCH_ATTEMPTS) {
+      await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
+      continue;
+    }
+
+    if (needsRetry) {
+      break;
+    }
+
+    return { aborted: false, complete: true, payload: buildAppTagPayload(result) };
+  }
+
+  if (shouldAbort()) {
+    return { aborted: true, complete: false, payload: null };
+  }
+
+  return {
+    aborted: false,
+    complete: false,
+    payload: lastResult ? buildAppTagPayload(lastResult) : null,
   };
 }
 
@@ -1875,7 +2019,7 @@ app.post(
   }
 );
 
-app.get("/api/app/:appid/tags", async (req, res) => {
+app.get("/api/app/:appid/tags", publicTagsRateLimiter, async (req, res) => {
   const { appid } = req.params;
   const lang = String(req.query.lang || DEFAULT_LANG).trim();
   const requestCookie = req.header("x-steam-cookie") || "";
@@ -1897,123 +2041,71 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 
   try {
     if (!requestHasExplicitCookie) {
-      const cachedPayload = getCacheEntry(appTagResponseCache, appTagCacheKey);
-      if (cachedPayload) {
-        return res.json({
-          success: true,
-          data: cachedPayload,
-          warning: null,
-        });
+      // 缓存条目统一为 { complete, payload }：complete 为假是失败结果的短 TTL 负缓存，
+      // 命中时直接回 504，不再触发上游抓取。
+      const cachedEntry = getCacheEntry(appTagResponseCache, appTagCacheKey);
+      if (cachedEntry) {
+        if (cachedEntry.complete) {
+          return res.json({
+            success: true,
+            data: cachedEntry.payload,
+            warning: null,
+          });
+        }
+
+        return sendIncompleteTagsResponse(res, cachedEntry.payload);
       }
     }
 
-    let lastResult = null;
+    let outcome;
 
-    for (
-      let attempt = 1;
-      attempt <= APP_TAGS_MAX_FETCH_ATTEMPTS && !requestClosed;
-      attempt++
-    ) {
-      const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
-        useStoredAuthCookies: false,
+    if (requestHasExplicitCookie) {
+      outcome = await fetchAppTagsPayload(appid, lang, requestCookie, {
+        shouldAbort: () => requestClosed,
       });
-      let result = anonymousResult;
-      lastResult = anonymousResult;
+    } else {
+      let inflight = appTagInflightRequests.get(appTagCacheKey);
 
-      const shouldRetryWithStoredAuth =
-        !requestHasExplicitCookie &&
-        hasStoredAuthCookies() &&
-        (anonymousResult.tags.length === 0 ||
-          anonymousResult.developers.length === 0 ||
-          looksLikeLoginOrPreferenceRestricted(
-            anonymousResult.rawHtml,
-            anonymousResult.finalUrl
-          ));
+      if (inflight) {
+        outcome = await inflight;
+      } else {
+        inflight = (async () => {
+          const result = await fetchAppTagsPayload(appid, lang, "");
 
-      if (shouldRetryWithStoredAuth) {
-        const authenticatedResult = await fetchSteamTags(appid, lang, "", {
-          useStoredAuthCookies: true,
-        });
+          setCacheEntry(
+            appTagResponseCache,
+            appTagCacheKey,
+            { complete: result.complete, payload: result.payload },
+            result.complete ? APP_TAGS_CACHE_TTL_MS : APP_TAGS_NEGATIVE_CACHE_TTL_MS,
+            APP_TAGS_CACHE_MAX_ENTRIES
+          );
 
-        if (
-          scoreSteamResult(authenticatedResult) > scoreSteamResult(anonymousResult) ||
-          (hasCompleteTagPayload(authenticatedResult) &&
-            looksLikeLoginOrPreferenceRestricted(
-              anonymousResult.rawHtml,
-              anonymousResult.finalUrl
-            ) &&
-            !looksLikeLoginOrPreferenceRestricted(
-              authenticatedResult.rawHtml,
-              authenticatedResult.finalUrl
-            ))
-        ) {
-          result = authenticatedResult;
+          return result;
+        })();
+
+        appTagInflightRequests.set(appTagCacheKey, inflight);
+
+        try {
+          outcome = await inflight;
+        } finally {
+          appTagInflightRequests.delete(appTagCacheKey);
         }
-
-        lastResult = result;
       }
+    }
 
-      if (requestClosed) {
-        return;
-      }
+    if (outcome.aborted || requestClosed) {
+      return;
+    }
 
-      const needsRetry =
-        isAgeGate(result.rawHtml, result.finalUrl) || !hasCompleteTagPayload(result);
-
-      if (needsRetry && attempt < APP_TAGS_MAX_FETCH_ATTEMPTS) {
-        await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
-        continue;
-      }
-
-      if (needsRetry) {
-        break;
-      }
-
-      const payload = {
-        appid: result.appid,
-        name: result.name,
-        aliases: result.aliases,
-        releaseDate: result.releaseDate,
-        tags: result.tags,
-        developers: result.developers,
-      };
-
-      if (!requestHasExplicitCookie) {
-        setCacheEntry(
-          appTagResponseCache,
-          appTagCacheKey,
-          payload,
-          APP_TAGS_CACHE_TTL_MS,
-          APP_TAGS_CACHE_MAX_ENTRIES
-        );
-      }
-
+    if (outcome.complete) {
       return res.json({
         success: true,
-        data: payload,
+        data: outcome.payload,
         warning: null,
       });
     }
 
-    if (requestClosed) {
-      return;
-    }
-
-    return res.status(504).json({
-      success: false,
-      error: "INCOMPLETE_UPSTREAM_DATA",
-      message: `在 ${APP_TAGS_MAX_FETCH_ATTEMPTS} 次尝试后仍未获取到完整 tags/developers 数据`,
-      data: lastResult
-        ? {
-            appid: lastResult.appid,
-            name: lastResult.name,
-            aliases: lastResult.aliases,
-            releaseDate: lastResult.releaseDate,
-            tags: lastResult.tags,
-            developers: lastResult.developers,
-          }
-        : null,
-    });
+    return sendIncompleteTagsResponse(res, outcome.payload);
   } catch (err) {
     const message =
       err?.response?.status
