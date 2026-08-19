@@ -1392,6 +1392,17 @@ function isAgeGate(html = "", url = "") {
   );
 }
 
+function redirectedOffAppPage(finalUrl, appid) {
+  try {
+    const { pathname } = new URL(finalUrl);
+    // 放行商店页自身的 slug 重定向（/app/<id>/<slug>/）和年龄门（/agecheck/app/<id>/）；
+    // 无效或已下架 appid 会被 302 到商店首页（约 1MB），此时返回 true。
+    return !new RegExp(`^/(?:agecheck/)?app/${appid}(?:/|$)`).test(pathname);
+  } catch {
+    return false; // URL 解析失败时不改变既有行为
+  }
+}
+
 function looksLikeLoginOrPreferenceRestricted(html = "", finalUrl = "") {
   // 只认结构化特征：全文关键词（login/adult/登录 等）会命中所有正常商店页的
   // 全局页头和内嵌 JSON，导致该判定恒真
@@ -1743,7 +1754,11 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     finalUrl = getFinalUrl(response, appUrl);
   }
 
-  const { tags, developers } = extractTags(html);
+  // 302 已离开 app 页时跳过解析：对 1MB 首页做同步 cheerio 解析只会得到空结果并阻塞事件循环
+  const redirectedOff = redirectedOffAppPage(finalUrl, appid);
+  const { tags, developers } = redirectedOff
+    ? { tags: [], developers: [] }
+    : extractTags(html);
   const metadata = await fetchLocalizedAppMetadata(client, appid);
 
   const usedAuthenticatedCookie = Boolean(
@@ -1760,6 +1775,7 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     developers,
     ageGateHandled,
     usedAuthenticatedCookie,
+    redirectedOffAppPage: redirectedOff,
     rawHtml: html,
   };
 }
@@ -1838,6 +1854,12 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
 
     if (shouldAbort()) {
       return { aborted: true, complete: false, payload: null };
+    }
+
+    // 302 已离开 app 页（无效/已下架 appid）时重试不会改变重定向目标，直接落负缓存；
+    // 托管 Cookie 重抓已在本轮内发生，若认证结果落回了 app 页则 result 不带该标志。
+    if (result.redirectedOffAppPage) {
+      break;
     }
 
     const needsRetry =
