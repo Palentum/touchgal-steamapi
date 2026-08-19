@@ -115,7 +115,7 @@ http://127.0.0.1:8765
 | `HOST` | `127.0.0.1` | 服务监听地址。默认只监听本机；暴露到公网或经反代转发时，务必同时配置 `ADMIN_API_KEY` 和 `TRUST_PROXY` |
 | `DEFAULT_LANG` | `schinese` | 默认语言，可通过请求参数覆盖 |
 | `REQUEST_TIMEOUT_MS` | `10000` | 单次上游请求超时时间（毫秒） |
-| `MAX_RETRIES` | `3` | 最大重试次数 |
+| `MAX_RETRIES` | `3` | 单次上游请求的最大尝试次数（含首次请求，必须 ≥ 1；填 `0` 或非法值会回退默认值并打印告警） |
 | `RETRY_BASE_DELAY_MS` | `800` | 重试基础退避时间（毫秒） |
 | `EMPTY_RESULT_RETRY_DELAY_MS` | `1500` | 当 `tags` 或 `developers` 为空时，下一次轮询前的等待时间（毫秒） |
 | `APP_TAGS_MAX_FETCH_ATTEMPTS` | `3` | 单次接口请求最多向上游尝试抓取完整结果的次数，超过后返回 `504` |

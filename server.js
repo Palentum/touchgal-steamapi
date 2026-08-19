@@ -30,46 +30,36 @@ const app = express();
 const PORT = Number(process.env.PORT || 8765);
 const HOST = String(process.env.HOST || "127.0.0.1").trim() || "127.0.0.1";
 const DEFAULT_LANG = process.env.DEFAULT_LANG || "schinese";
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 10000);
-const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
-const RETRY_BASE_DELAY_MS = Number(process.env.RETRY_BASE_DELAY_MS || 800);
-const EMPTY_RESULT_RETRY_DELAY_MS = Number(
-  process.env.EMPTY_RESULT_RETRY_DELAY_MS || 1500
-);
-const APP_TAGS_MAX_FETCH_ATTEMPTS = toPositiveInteger(
-  process.env.APP_TAGS_MAX_FETCH_ATTEMPTS,
-  3
-);
-const APP_DETAILS_CACHE_TTL_MS = toPositiveInteger(
-  process.env.APP_DETAILS_CACHE_TTL_MS,
+const REQUEST_TIMEOUT_MS = envInt("REQUEST_TIMEOUT_MS", 10000);
+// 语义为"总尝试次数"（含首次请求），必须 ≥ 1
+const MAX_RETRIES = envInt("MAX_RETRIES", 3);
+const RETRY_BASE_DELAY_MS = envInt("RETRY_BASE_DELAY_MS", 800);
+const EMPTY_RESULT_RETRY_DELAY_MS = envInt("EMPTY_RESULT_RETRY_DELAY_MS", 1500);
+const APP_TAGS_MAX_FETCH_ATTEMPTS = envInt("APP_TAGS_MAX_FETCH_ATTEMPTS", 3);
+const APP_DETAILS_CACHE_TTL_MS = envInt(
+  "APP_DETAILS_CACHE_TTL_MS",
   10 * 60 * 1000
 );
-const APP_DETAILS_CACHE_MAX_ENTRIES = toPositiveInteger(
-  process.env.APP_DETAILS_CACHE_MAX_ENTRIES,
-  500
-);
-const APP_TAGS_CACHE_TTL_MS = toPositiveInteger(
-  process.env.APP_TAGS_CACHE_TTL_MS,
-  2 * 60 * 1000
-);
-const APP_TAGS_CACHE_MAX_ENTRIES = toPositiveInteger(
-  process.env.APP_TAGS_CACHE_MAX_ENTRIES,
-  500
-);
+const APP_DETAILS_CACHE_MAX_ENTRIES = envInt("APP_DETAILS_CACHE_MAX_ENTRIES", 500);
+const APP_TAGS_CACHE_TTL_MS = envInt("APP_TAGS_CACHE_TTL_MS", 2 * 60 * 1000);
+const APP_TAGS_CACHE_MAX_ENTRIES = envInt("APP_TAGS_CACHE_MAX_ENTRIES", 500);
 // 失败结果（504 不完整数据、appdetails 查无此 app）的短 TTL 负缓存，
 // 用来压制无效 appid 反复触发全量上游抓取的放大攻击面。
-const APP_TAGS_NEGATIVE_CACHE_TTL_MS = toPositiveInteger(
-  process.env.APP_TAGS_NEGATIVE_CACHE_TTL_MS,
+const APP_TAGS_NEGATIVE_CACHE_TTL_MS = envInt(
+  "APP_TAGS_NEGATIVE_CACHE_TTL_MS",
   60 * 1000
 );
-const STEAM_SESSION_REFRESH_INTERVAL_MS = Number(
-  process.env.STEAM_SESSION_REFRESH_INTERVAL_MS || 30 * 60 * 1000
+const STEAM_SESSION_REFRESH_INTERVAL_MS = envInt(
+  "STEAM_SESSION_REFRESH_INTERVAL_MS",
+  30 * 60 * 1000
 );
-const STEAM_SESSION_LOGIN_TIMEOUT_MS = Number(
-  process.env.STEAM_SESSION_LOGIN_TIMEOUT_MS || 5 * 60 * 1000
+const STEAM_SESSION_LOGIN_TIMEOUT_MS = envInt(
+  "STEAM_SESSION_LOGIN_TIMEOUT_MS",
+  5 * 60 * 1000
 );
-const STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS = Number(
-  process.env.STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS || 10 * 60 * 1000
+const STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS = envInt(
+  "STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS",
+  10 * 60 * 1000
 );
 const STEAM_SESSION_STORE_PATH = path.resolve(
   process.cwd(),
@@ -89,28 +79,13 @@ const ADMIN_API_KEY_PLACEHOLDERS = new Set([
 ]);
 const ADMIN_API_KEY_RAW = String(process.env.ADMIN_API_KEY || "").trim();
 const ADMIN_API_KEY = normalizeAdminApiKey(ADMIN_API_KEY_RAW);
-const ADMIN_ROUTE_WINDOW_MS = toPositiveInteger(
-  process.env.ADMIN_ROUTE_WINDOW_MS,
-  5 * 60 * 1000
-);
-const ADMIN_ROUTE_MAX_REQUESTS = toPositiveInteger(
-  process.env.ADMIN_ROUTE_MAX_REQUESTS,
-  12
-);
-const PUBLIC_ROUTE_WINDOW_MS = toPositiveInteger(
-  process.env.PUBLIC_ROUTE_WINDOW_MS,
-  60 * 1000
-);
-const PUBLIC_ROUTE_MAX_REQUESTS = toPositiveInteger(
-  process.env.PUBLIC_ROUTE_MAX_REQUESTS,
-  30
-);
+const ADMIN_ROUTE_WINDOW_MS = envInt("ADMIN_ROUTE_WINDOW_MS", 5 * 60 * 1000);
+const ADMIN_ROUTE_MAX_REQUESTS = envInt("ADMIN_ROUTE_MAX_REQUESTS", 12);
+const PUBLIC_ROUTE_WINDOW_MS = envInt("PUBLIC_ROUTE_WINDOW_MS", 60 * 1000);
+const PUBLIC_ROUTE_MAX_REQUESTS = envInt("PUBLIC_ROUTE_MAX_REQUESTS", 30);
 // 部署在反代后面时必须配置，否则 req.ip 恒为反代地址，管理写接口的限流会退化成全局共用一个桶。
 const TRUST_PROXY_SETTING = resolveTrustProxySetting(process.env.TRUST_PROXY);
-const SHUTDOWN_TIMEOUT_MS = toPositiveInteger(
-  process.env.SHUTDOWN_TIMEOUT_MS,
-  10000
-);
+const SHUTDOWN_TIMEOUT_MS = envInt("SHUTDOWN_TIMEOUT_MS", 10000);
 
 // 可选：把你自己浏览器里的 Steam Cookie 整串放到环境变量里。
 // 也可以每次请求时通过 X-Steam-Cookie 请求头单独传入。
@@ -256,6 +231,24 @@ function parseCsvList(value = "") {
 function toPositiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// 读取正整数环境变量；已设置且非空白但无效时打告警并回退默认值。
+function envInt(name, fallback) {
+  const raw = process.env[name];
+  const parsed = toPositiveInteger(raw, null);
+
+  if (parsed !== null) {
+    return parsed;
+  }
+
+  if (raw?.trim()) {
+    console.warn(
+      `[config] 环境变量 ${name} 的值 ${JSON.stringify(raw)} 无效（需为正整数），已回退为 ${fallback}`
+    );
+  }
+
+  return fallback;
 }
 
 // 占位值和过短的密钥一律当作未配置，避免「设了等于没设」。入参必须是已 trim 的字符串。
