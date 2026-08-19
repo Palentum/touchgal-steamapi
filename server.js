@@ -74,7 +74,15 @@ const STEAM_SESSION_COOKIE_DOMAINS = parseCsvList(
     "store.steampowered.com,steamcommunity.com,help.steampowered.com"
 );
 const JSON_BODY_LIMIT = String(process.env.JSON_BODY_LIMIT || "16kb").trim() || "16kb";
-const ADMIN_API_KEY = String(process.env.ADMIN_API_KEY || "").trim();
+const ADMIN_API_KEY_MIN_LENGTH = 16;
+const ADMIN_API_KEY_PLACEHOLDERS = new Set([
+  "replace_me",
+  "changeme",
+  "change_me",
+  "your_api_key",
+]);
+const ADMIN_API_KEY_RAW = String(process.env.ADMIN_API_KEY || "").trim();
+const ADMIN_API_KEY = normalizeAdminApiKey(ADMIN_API_KEY_RAW);
 const ADMIN_ROUTE_WINDOW_MS = toPositiveInteger(
   process.env.ADMIN_ROUTE_WINDOW_MS,
   5 * 60 * 1000
@@ -83,6 +91,8 @@ const ADMIN_ROUTE_MAX_REQUESTS = toPositiveInteger(
   process.env.ADMIN_ROUTE_MAX_REQUESTS,
   12
 );
+// 部署在反代后面时必须配置，否则 req.ip 恒为反代地址，管理写接口的限流会退化成全局共用一个桶。
+const TRUST_PROXY_SETTING = resolveTrustProxySetting(process.env.TRUST_PROXY);
 const SHUTDOWN_TIMEOUT_MS = toPositiveInteger(
   process.env.SHUTDOWN_TIMEOUT_MS,
   10000
@@ -183,6 +193,7 @@ let steamCookieRefreshTimer = null;
 let server = null;
 let isShuttingDown = false;
 
+app.set("trust proxy", TRUST_PROXY_SETTING);
 app.disable("x-powered-by");
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use((req, res, next) => {
@@ -229,6 +240,41 @@ function parseCsvList(value = "") {
 function toPositiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// 占位值和过短的密钥一律当作未配置，避免「设了等于没设」。入参必须是已 trim 的字符串。
+function normalizeAdminApiKey(key) {
+  if (!key || ADMIN_API_KEY_PLACEHOLDERS.has(key.toLowerCase())) {
+    return "";
+  }
+
+  return key.length >= ADMIN_API_KEY_MIN_LENGTH ? key : "";
+}
+
+function resolveTrustProxySetting(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return false;
+  }
+
+  // 纯数字按 Express 语义解释为信任的反代跳数，0 等价于不信任。
+  // 这个分支必须排在下面的布尔判断之前：parseBooleanEnv 也认 "1"，
+  // 但 trust proxy 的 1（只信任最后一跳）和 true（信任整条 XFF 链）安全含义完全不同。
+  const hops = Number(raw);
+  if (Number.isInteger(hops) && hops >= 0) {
+    return hops;
+  }
+
+  if (parseBooleanEnv(raw)) {
+    return true;
+  }
+
+  if (["false", "no", "off"].includes(raw.toLowerCase())) {
+    return false;
+  }
+
+  // 其余原样交给 Express，支持 IP、CIDR 和 loopback 等预设名。
+  return raw;
 }
 
 function cloneJsonValue(value) {
@@ -309,7 +355,11 @@ function requireAdminAccess(req, res, next) {
   res.setHeader("Cache-Control", "no-store");
 
   if (!ADMIN_API_KEY) {
-    return next();
+    return res.status(403).json({
+      success: false,
+      error: "ADMIN_API_DISABLED",
+      message: `管理接口未启用：服务端未配置有效的 ADMIN_API_KEY（至少 ${ADMIN_API_KEY_MIN_LENGTH} 位且不能是占位值）`,
+    });
   }
 
   if (safeTimingEqual(ADMIN_API_KEY, extractApiKey(req))) {
@@ -796,7 +846,7 @@ function getSteamSessionStatus() {
 
   return {
     provider: "steam-session",
-    storePath: STEAM_SESSION_STORE_PATH,
+    storeFileName: path.basename(STEAM_SESSION_STORE_PATH),
     refreshIntervalMs: STEAM_SESSION_REFRESH_INTERVAL_MS,
     loginTimeoutMs: STEAM_SESSION_LOGIN_TIMEOUT_MS,
     cookieDomains: STEAM_SESSION_COOKIE_DOMAINS,
@@ -1981,7 +2031,24 @@ app.get("/api/app/:appid/tags", async (req, res) => {
   }
 });
 
+function warnIfAdminApiDisabled() {
+  if (ADMIN_API_KEY) {
+    return;
+  }
+
+  const reason = ADMIN_API_KEY_RAW
+    ? `当前 ADMIN_API_KEY 是占位值或长度不足 ${ADMIN_API_KEY_MIN_LENGTH} 位`
+    : "未设置 ADMIN_API_KEY";
+
+  console.warn(
+    `[security] 管理接口已禁用（${reason}）。/api/steam-auth/* 与 /api/steam-cookies/* 将一律返回 403，` +
+      "无法完成交互式登录。如需启用，请生成一个随机密钥：openssl rand -hex 32"
+  );
+}
+
 async function startServer() {
+  warnIfAdminApiDisabled();
+
   if (SOCKS5_PROXY_URL) {
     console.log(
       `[proxy] 对外请求已启用 SOCKS5 代理: ${new URL(SOCKS5_PROXY_URL).host}`

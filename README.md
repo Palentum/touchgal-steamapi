@@ -112,7 +112,7 @@ http://127.0.0.1:8765
 | 变量名 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8765` | 服务监听端口 |
-| `HOST` | `127.0.0.1` | 服务监听地址。默认只监听本机，若暴露到公网建议同时设置 `ADMIN_API_KEY` |
+| `HOST` | `127.0.0.1` | 服务监听地址。默认只监听本机；暴露到公网或经反代转发时，务必同时配置 `ADMIN_API_KEY` 和 `TRUST_PROXY` |
 | `DEFAULT_LANG` | `schinese` | 默认语言，可通过请求参数覆盖 |
 | `REQUEST_TIMEOUT_MS` | `10000` | 单次上游请求超时时间（毫秒） |
 | `MAX_RETRIES` | `3` | 最大重试次数 |
@@ -132,9 +132,10 @@ http://127.0.0.1:8765
 | `STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS` | `600000` | 登录会话在内存中保留的时长（毫秒） |
 | `STEAM_SESSION_COOKIE_DOMAINS` | `store.steampowered.com,steamcommunity.com,help.steampowered.com` | 自动映射 Cookie 的域名列表，逗号分隔 |
 | `JSON_BODY_LIMIT` | `16kb` | JSON 请求体大小限制 |
-| `ADMIN_API_KEY` | 空 | 可选。设置后，`/api/steam-auth/*` 和 `/api/steam-cookies/*` 需要 `X-API-Key` 或 `Authorization: Bearer <key>` |
+| `ADMIN_API_KEY` | 空 | **启用管理接口的必要条件**。`/api/steam-auth/*` 和 `/api/steam-cookies/*` 需要 `X-API-Key` 或 `Authorization: Bearer <key>`。未配置、使用占位值（如 `replace_me`）或长度不足 16 位时，这些接口一律返回 `403`，交互式登录不可用（不影响 `/api/app/:appid/tags`）。建议用 `openssl rand -hex 32` 生成 |
 | `ADMIN_ROUTE_WINDOW_MS` | `300000` | 管理写接口限流窗口（毫秒） |
 | `ADMIN_ROUTE_MAX_REQUESTS` | `12` | 单个客户端在限流窗口内允许访问管理写接口的最大次数 |
+| `TRUST_PROXY` | 空（不信任） | 部署在 Nginx 等反代后面时必填，否则 `req.ip` 恒为反代地址、上面的限流会退化成所有调用者共用一个桶。取值：数字表示信任的反代跳数（单层反代填 `1`）、`true` 表示全信任、也接受 IP / CIDR / `loopback` 等 Express 预设名 |
 | `SHUTDOWN_TIMEOUT_MS` | `10000` | 进程收到退出信号后的优雅停机等待时间（毫秒），超过后会强制断开剩余连接 |
 
 示例：
@@ -144,7 +145,10 @@ http://127.0.0.1:8765
 PORT=8765
 DEFAULT_LANG=schinese
 STEAM_SESSION_STORE_PATH=./steam-session-auth.json
-ADMIN_API_KEY=replace_me
+# 下面是示例值，务必换成你自己的：openssl rand -hex 32
+ADMIN_API_KEY=3f0b7c1d9a4e6528b1d47f0c9e2a8b5647fd3c10e98a2b6741cd05e3f8a92b7c
+# 单层 Nginx 反代填 1；直连不填
+TRUST_PROXY=1
 ```
 
 ```bash
@@ -215,10 +219,20 @@ curl http://127.0.0.1:8765/api/steam-auth/login/ef1f07f5-8fd8-48ca-a2c2-6a9d4c51
 - 立即换取一组可用的 Steam Cookie
 - 启动定时刷新 Cookie
 
-如果设置了 `ADMIN_API_KEY`，上面的管理接口请求需要额外携带：
+上面的管理接口请求**必须**携带 `ADMIN_API_KEY`：
 
 ```bash
 -H "X-API-Key: your_admin_key"
+```
+
+服务端未配置有效的 `ADMIN_API_KEY` 时，这些接口会直接返回：
+
+```json
+{
+  "success": false,
+  "error": "ADMIN_API_DISABLED",
+  "message": "管理接口未启用：服务端未配置有效的 ADMIN_API_KEY（至少 16 位且不能是占位值）"
+}
 ```
 
 ## 接口
