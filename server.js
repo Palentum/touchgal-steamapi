@@ -1359,27 +1359,14 @@ function isAgeGate(html = "", url = "") {
   );
 }
 
-function looksLikeLoginOrPreferenceRestricted(html = "") {
-  const normalizedHtml = String(html || "");
-
-  if (
-    /sign in|login/i.test(normalizedHtml) &&
-    /(mature content|store preferences|age assurance|view page|adult|sexual content)/i.test(
-      normalizedHtml
-    )
-  ) {
+function looksLikeLoginOrPreferenceRestricted(html = "", finalUrl = "") {
+  // 只认结构化特征：全文关键词（login/adult/登录 等）会命中所有正常商店页的
+  // 全局页头和内嵌 JSON，导致该判定恒真
+  if (String(finalUrl || "").includes("/login")) {
     return true;
   }
 
-  if (
-    /登录|登入|偏好设置|商店偏好|成人内容|成人视频|仅限成年人|查看页面|年龄验证|内容警告/i.test(
-      normalizedHtml
-    )
-  ) {
-    return true;
-  }
-
-  const $ = cheerio.load(normalizedHtml);
+  const $ = cheerio.load(String(html || ""));
 
   return Boolean(
     $("#view_product_page_btn").length ||
@@ -1938,7 +1925,10 @@ app.get("/api/app/:appid/tags", async (req, res) => {
         hasStoredAuthCookies() &&
         (anonymousResult.tags.length === 0 ||
           anonymousResult.developers.length === 0 ||
-          looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml));
+          looksLikeLoginOrPreferenceRestricted(
+            anonymousResult.rawHtml,
+            anonymousResult.finalUrl
+          ));
 
       if (shouldRetryWithStoredAuth) {
         const authenticatedResult = await fetchSteamTags(appid, lang, "", {
@@ -1947,8 +1937,15 @@ app.get("/api/app/:appid/tags", async (req, res) => {
 
         if (
           scoreSteamResult(authenticatedResult) > scoreSteamResult(anonymousResult) ||
-          (looksLikeLoginOrPreferenceRestricted(anonymousResult.rawHtml) &&
-            !looksLikeLoginOrPreferenceRestricted(authenticatedResult.rawHtml))
+          (hasCompleteTagPayload(authenticatedResult) &&
+            looksLikeLoginOrPreferenceRestricted(
+              anonymousResult.rawHtml,
+              anonymousResult.finalUrl
+            ) &&
+            !looksLikeLoginOrPreferenceRestricted(
+              authenticatedResult.rawHtml,
+              authenticatedResult.finalUrl
+            ))
         ) {
           result = authenticatedResult;
         }
