@@ -34,8 +34,14 @@ const REQUEST_TIMEOUT_MS = envInt("REQUEST_TIMEOUT_MS", 10000);
 // 语义为"总尝试次数"（含首次请求），必须 ≥ 1
 const MAX_RETRIES = envInt("MAX_RETRIES", 3);
 const RETRY_BASE_DELAY_MS = envInt("RETRY_BASE_DELAY_MS", 800);
+// 上游 Retry-After 头的最大可信等待时间：delay 完全由上游可控，不封顶时
+// 一个 429 + Retry-After: 3600 就能把重试循环挂住一小时。
+const MAX_RETRY_AFTER_DELAY_MS = envInt("MAX_RETRY_AFTER_DELAY_MS", 30 * 1000);
 const EMPTY_RESULT_RETRY_DELAY_MS = envInt("EMPTY_RESULT_RETRY_DELAY_MS", 1500);
 const APP_TAGS_MAX_FETCH_ATTEMPTS = envInt("APP_TAGS_MAX_FETCH_ATTEMPTS", 3);
+// 单次抓取循环（fetchAppTagsPayload 全部轮次）的总截止时间：超时后不再开启
+// 新一轮或新的重试等待，直接返回已有的不完整结果（路由回 504 并落负缓存）。
+const APP_TAGS_TOTAL_DEADLINE_MS = envInt("APP_TAGS_TOTAL_DEADLINE_MS", 90 * 1000);
 const APP_DETAILS_CACHE_TTL_MS = envInt(
   "APP_DETAILS_CACHE_TTL_MS",
   10 * 60 * 1000
@@ -504,10 +510,13 @@ async function requestWithRetry(client, config) {
           return response;
         }
 
-        const retryAfter = Number(response.headers?.["retry-after"]);
-        const delay = Number.isFinite(retryAfter)
-          ? retryAfter * 1000
-          : RETRY_BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 250);
+        // 只信任 (0, MAX_RETRY_AFTER_DELAY_MS] 区间内的 Retry-After 秒数；
+        // 空头（Number("") === 0）、负值、HTTP-date（NaN）一律回落到指数退避。
+        const retryAfterSec = Number(response.headers?.["retry-after"]);
+        const delay =
+          Number.isFinite(retryAfterSec) && retryAfterSec > 0
+            ? Math.min(retryAfterSec * 1000, MAX_RETRY_AFTER_DELAY_MS)
+            : RETRY_BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 250);
 
         await sleep(delay);
         continue;
@@ -1813,11 +1822,17 @@ function sendIncompleteTagsResponse(res, payload) {
 async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}) {
   const { shouldAbort = () => false } = options;
   const requestHasExplicitCookie = Boolean(requestCookie);
+  // 总截止时间只在轮次边界检查，不打断在途的上游请求：超时后不再开新一轮，
+  // 走底部 complete: false 返回（504 + 负缓存），而非 aborted（不回响应）。
+  const deadlineAt = Date.now() + APP_TAGS_TOTAL_DEADLINE_MS;
+  const deadlineExceeded = () => Date.now() >= deadlineAt;
   let lastResult = null;
 
   for (
     let attempt = 1;
-    attempt <= APP_TAGS_MAX_FETCH_ATTEMPTS && !shouldAbort();
+    attempt <= APP_TAGS_MAX_FETCH_ATTEMPTS &&
+    !shouldAbort() &&
+    !deadlineExceeded();
     attempt++
   ) {
     const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
@@ -1872,7 +1887,11 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
     const needsRetry =
       isAgeGate(result.rawHtml, result.finalUrl) || !hasCompleteTagPayload(result);
 
-    if (needsRetry && attempt < APP_TAGS_MAX_FETCH_ATTEMPTS) {
+    if (
+      needsRetry &&
+      attempt < APP_TAGS_MAX_FETCH_ATTEMPTS &&
+      !deadlineExceeded()
+    ) {
       await sleep(EMPTY_RESULT_RETRY_DELAY_MS);
       continue;
     }

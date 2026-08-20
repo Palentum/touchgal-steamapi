@@ -117,8 +117,10 @@ http://127.0.0.1:8765
 | `REQUEST_TIMEOUT_MS` | `10000` | 单次上游请求超时时间（毫秒） |
 | `MAX_RETRIES` | `3` | 单次上游请求的最大尝试次数（含首次请求，必须 ≥ 1；填 `0` 或非法值会回退默认值并打印告警） |
 | `RETRY_BASE_DELAY_MS` | `800` | 重试基础退避时间（毫秒） |
+| `MAX_RETRY_AFTER_DELAY_MS` | `30000` | 上游 `Retry-After` 头的最大可信等待时间（毫秒）：超出部分钳制到该值，空值/负值/HTTP-date 形式回落到指数退避 |
 | `EMPTY_RESULT_RETRY_DELAY_MS` | `1500` | 当 `tags` 或 `developers` 为空时，下一次轮询前的等待时间（毫秒） |
 | `APP_TAGS_MAX_FETCH_ATTEMPTS` | `3` | 单次接口请求最多向上游尝试抓取完整结果的次数，超过后返回 `504` |
+| `APP_TAGS_TOTAL_DEADLINE_MS` | `90000` | 单次接口请求整个抓取循环的总截止时间（毫秒）：超时后不再开启新一轮重试，直接返回 `504` 和已有的部分数据 |
 | `APP_DETAILS_CACHE_TTL_MS` | `600000` | Steam `appdetails` 元数据缓存时长（毫秒） |
 | `APP_DETAILS_CACHE_MAX_ENTRIES` | `500` | Steam `appdetails` 元数据缓存最大条目数 |
 | `APP_TAGS_CACHE_TTL_MS` | `120000` | 成功抓取到的标签结果缓存时长（毫秒） |
