@@ -2068,24 +2068,38 @@ app.post(
 );
 
 app.get("/api/app/:appid/tags", publicTagsRateLimiter, async (req, res) => {
-  const { appid } = req.params;
+  const rawAppid = req.params.appid;
   const lang = String(req.query.lang || DEFAULT_LANG).trim();
   const requestCookie = req.header("x-steam-cookie") || "";
   const requestHasExplicitCookie = Boolean(requestCookie);
-  const appTagCacheKey = `${appid}:${lang}`;
   let requestClosed = false;
 
   req.on("close", () => {
     requestClosed = true;
   });
 
-  if (!/^\d+$/.test(appid)) {
+  if (!/^\d+$/.test(rawAppid)) {
     return res.status(400).json({
       success: false,
       error: "INVALID_APPID",
       message: "appid 必须是纯数字",
     });
   }
+
+  // Steam 会规范化 appdetails 的 appids 参数并按去零后的键返回（0570 → "570"），
+  // 原样透传会导致取键落空、缓存键分裂，这里统一去前导零后再用于抓取与缓存。
+  const appid = rawAppid.replace(/^0+(?=\d)/, "");
+
+  // Steam appid 是 32 位无符号整数，超过 10 位必然无效，直接拒绝。
+  if (appid.length > 10) {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_APPID",
+      message: "appid 超出有效范围",
+    });
+  }
+
+  const appTagCacheKey = `${appid}:${lang}`;
 
   try {
     if (!requestHasExplicitCookie) {
