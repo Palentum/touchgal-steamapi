@@ -1670,8 +1670,19 @@ async function fetchAppDetails(client, appid, lang) {
       headers: buildRequestHeaders(lang),
     });
 
+    // 非 2xx（重试耗尽后的 429/5xx 也会走到这）和响应体解析失败是上游故障，
+    // 不是"查无此 app"：抛错且不写负缓存，否则一次瞬时限流会被当成 app 不存在
+    // 缓存 60s，同一请求后续轮次的重试全部命中负缓存、元数据永远无法恢复。
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`appdetails 上游返回 HTTP ${response.status}`);
+    }
+
     const payload = safeParseJson(response.data);
-    const entry = payload?.[String(appid)];
+    if (!payload) {
+      throw new Error("appdetails 响应体不是合法 JSON");
+    }
+
+    const entry = payload[String(appid)];
 
     if (!entry?.success || !entry.data) {
       // 查无此 app 也要短暂缓存（哨兵 { missing: true }，缓存值为 null 会被
@@ -1707,19 +1718,28 @@ async function fetchAppDetails(client, appid, lang) {
 }
 
 async function fetchLocalizedAppMetadata(client, appid) {
-  const detailRequests = await Promise.allSettled([
-    fetchAppDetails(client, appid, "schinese"),
-    fetchAppDetails(client, appid, "english"),
-    fetchAppDetails(client, appid, "japanese"),
-    fetchAppDetails(client, appid, "tchinese"),
-  ]);
+  const languages = ["schinese", "english", "japanese", "tchinese"];
+  const detailRequests = await Promise.allSettled(
+    languages.map((lang) => fetchAppDetails(client, appid, lang))
+  );
 
   const [schinese, english, japanese, tchinese] = detailRequests.map((result) =>
     result.status === "fulfilled" ? result.value : null
   );
+  // rejected 表示 appdetails 上游故障（非 2xx / 解析失败 / 网络错误），
+  // 与"确认查无此 app"（fulfilled 且值为 null）不同，前者可通过重试恢复。
+  const metadataFailedLanguages = languages.filter(
+    (_, index) => detailRequests[index].status === "rejected"
+  );
 
   return {
-    name: normalizeName(schinese?.name),
+    // name 中文优先、releaseDate 以最常见的可解析格式优先，均依次回退到
+    // 其余语言，避免单一语言的 appdetails 失败把字段整个打成 null。
+    name:
+      normalizeName(schinese?.name) ||
+      normalizeName(tchinese?.name) ||
+      normalizeName(english?.name) ||
+      normalizeName(japanese?.name),
     aliases: {
       english: normalizeName(english?.name),
       japanese: normalizeName(japanese?.name),
@@ -1727,7 +1747,10 @@ async function fetchLocalizedAppMetadata(client, appid) {
     },
     releaseDate:
       normalizeReleaseDate(schinese?.release_date?.date) ||
-      normalizeReleaseDate(english?.release_date?.date),
+      normalizeReleaseDate(english?.release_date?.date) ||
+      normalizeReleaseDate(tchinese?.release_date?.date) ||
+      normalizeReleaseDate(japanese?.release_date?.date),
+    metadataFailedLanguages,
   };
 }
 
@@ -1792,6 +1815,7 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     ageGateHandled,
     usedAuthenticatedCookie,
     redirectedOffAppPage: redirectedOff,
+    metadataFailedLanguages: metadata.metadataFailedLanguages,
     rawHtml: html,
   };
 }
@@ -1805,6 +1829,16 @@ function buildAppTagPayload(result) {
     tags: result.tags,
     developers: result.developers,
   };
+}
+
+function buildMetadataWarning(result) {
+  if (result.metadataFailedLanguages.length === 0) {
+    return null;
+  }
+
+  return `部分语言（${result.metadataFailedLanguages.join(
+    "、"
+  )}）的 appdetails 请求失败，name/aliases/releaseDate 可能不完整`;
 }
 
 function sendIncompleteTagsResponse(res, payload) {
@@ -1875,7 +1909,7 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
     }
 
     if (shouldAbort()) {
-      return { aborted: true, complete: false, payload: null };
+      return { aborted: true, complete: false, payload: null, warning: null };
     }
 
     // 302 已离开 app 页（无效/已下架 appid）时重试不会改变重定向目标，直接落负缓存；
@@ -1884,8 +1918,12 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
       break;
     }
 
-    const needsRetry =
+    const tagsIncomplete =
       isAgeGate(result.rawHtml, result.finalUrl) || !hasCompleteTagPayload(result);
+    // 元数据降级（appdetails 上游故障）单独作为重试条件：tags 完整时耗尽重试后
+    // 仍按成功返回、只附带 warning，不把主数据当失败打成 504。成功语言已进
+    // appDetailsCache 正缓存，重试轮次只会重发失败的那几路。
+    const needsRetry = tagsIncomplete || result.metadataFailedLanguages.length > 0;
 
     if (
       needsRetry &&
@@ -1896,11 +1934,16 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
       continue;
     }
 
-    if (needsRetry) {
+    if (tagsIncomplete) {
       break;
     }
 
-    return { aborted: false, complete: true, payload: buildAppTagPayload(result) };
+    return {
+      aborted: false,
+      complete: true,
+      payload: buildAppTagPayload(result),
+      warning: buildMetadataWarning(result),
+    };
   }
 
   if (shouldAbort()) {
@@ -1911,6 +1954,7 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
     aborted: false,
     complete: false,
     payload: lastResult ? buildAppTagPayload(lastResult) : null,
+    warning: null,
   };
 }
 
@@ -2111,7 +2155,7 @@ app.get("/api/app/:appid/tags", publicTagsRateLimiter, async (req, res) => {
           return res.json({
             success: true,
             data: cachedEntry.payload,
-            warning: null,
+            warning: cachedEntry.warning,
           });
         }
 
@@ -2133,12 +2177,17 @@ app.get("/api/app/:appid/tags", publicTagsRateLimiter, async (req, res) => {
       } else {
         inflight = (async () => {
           const result = await fetchAppTagsPayload(appid, lang, "");
+          const warning = result.warning;
 
+          // 带 warning 的完整结果（元数据降级）只按短 TTL 缓存，
+          // 避免残缺 payload 占满正常缓存周期。
           setCacheEntry(
             appTagResponseCache,
             appTagCacheKey,
-            { complete: result.complete, payload: result.payload },
-            result.complete ? APP_TAGS_CACHE_TTL_MS : APP_TAGS_NEGATIVE_CACHE_TTL_MS,
+            { complete: result.complete, payload: result.payload, warning },
+            result.complete && !warning
+              ? APP_TAGS_CACHE_TTL_MS
+              : APP_TAGS_NEGATIVE_CACHE_TTL_MS,
             APP_TAGS_CACHE_MAX_ENTRIES
           );
 
@@ -2163,7 +2212,7 @@ app.get("/api/app/:appid/tags", publicTagsRateLimiter, async (req, res) => {
       return res.json({
         success: true,
         data: outcome.payload,
-        warning: null,
+        warning: outcome.warning,
       });
     }
 

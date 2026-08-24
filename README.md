@@ -313,6 +313,8 @@ curl -X POST http://127.0.0.1:8765/api/steam-cookies/sync
 
 - 如果 `tags` 或 `developers` 为空，接口会按 `EMPTY_RESULT_RETRY_DELAY_MS` 重试，最多重试 `APP_TAGS_MAX_FETCH_ATTEMPTS` 次
 - 如果连续重试后仍拿不到完整结果，接口会返回 `504`，并在 `data` 字段中附带最后一次抓取到的部分数据
+- `name`/`aliases`/`releaseDate` 来自 appdetails，某一语言抓取失败同样会触发上述重试，且 `name` 和 `releaseDate` 会在四种语言间依次回退
+- 如果重试耗尽后仍有语言的元数据获取失败，接口仍返回 `200`，但 `warning` 字段会说明哪些语言可能不完整（正常情况下 `warning` 为 `null`）
 
 请求示例：
 
