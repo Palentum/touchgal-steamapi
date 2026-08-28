@@ -314,6 +314,7 @@ curl -X POST http://127.0.0.1:8765/api/steam-cookies/sync
 - 如果 `tags` 或 `developers` 为空，接口会按 `EMPTY_RESULT_RETRY_DELAY_MS` 重试，最多重试 `APP_TAGS_MAX_FETCH_ATTEMPTS` 次
 - 如果连续重试后仍拿不到完整结果，接口会返回 `504`，并在 `data` 字段中附带最后一次抓取到的部分数据
 - `name`/`aliases`/`releaseDate` 来自 appdetails，某一语言抓取失败同样会触发上述重试，且 `name` 和 `releaseDate` 会在四种语言间依次回退
+- `comingSoon` 表示该作品是否未发售（来自 appdetails 的 `release_date.coming_soon`，四种语言的元数据全部获取失败时为 `null`）。未发售作品 Steam 会填 `9998-12-31` 之类的占位日期，因此 `comingSoon` 为 `true` 时 `releaseDate` 固定为 `null`
 - 如果重试耗尽后仍有语言的元数据获取失败，接口仍返回 `200`，但 `warning` 字段会说明哪些语言可能不完整（正常情况下 `warning` 为 `null`）
 
 请求示例：
@@ -343,6 +344,7 @@ curl "http://127.0.0.1:8765/api/app/620/tags?lang=schinese" \
       "tchinese": "傳送門 2"
     },
     "releaseDate": "2011-04-19",
+    "comingSoon": false,
     "tags": ["动作", "解谜", "合作"],
     "developers": [
       {

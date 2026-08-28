@@ -809,6 +809,16 @@ function formatDateParts(year, month, day) {
     return null;
   }
 
+  // 回读校验拒绝当月不存在的日期（如 2 月 31 日）。
+  const date = new Date(Date.UTC(y, m - 1, d));
+  if (
+    date.getUTCFullYear() !== y ||
+    date.getUTCMonth() !== m - 1 ||
+    date.getUTCDate() !== d
+  ) {
+    return null;
+  }
+
   return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(
     d
   ).padStart(2, "0")}`;
@@ -1732,6 +1742,15 @@ async function fetchLocalizedAppMetadata(client, appid) {
     (_, index) => detailRequests[index].status === "rejected"
   );
 
+  // coming_soon 与语言无关，取第一个可用响应即可；四种语言全失败时为 null（未知）。
+  const releaseInfo =
+    schinese?.release_date ||
+    english?.release_date ||
+    tchinese?.release_date ||
+    japanese?.release_date ||
+    null;
+  const comingSoon = releaseInfo ? Boolean(releaseInfo.coming_soon) : null;
+
   return {
     // name 中文优先、releaseDate 以最常见的可解析格式优先，均依次回退到
     // 其余语言，避免单一语言的 appdetails 失败把字段整个打成 null。
@@ -1745,11 +1764,14 @@ async function fetchLocalizedAppMetadata(client, appid) {
       japanese: normalizeName(japanese?.name),
       tchinese: normalizeName(tchinese?.name),
     },
-    releaseDate:
-      normalizeReleaseDate(schinese?.release_date?.date) ||
-      normalizeReleaseDate(english?.release_date?.date) ||
-      normalizeReleaseDate(tchinese?.release_date?.date) ||
-      normalizeReleaseDate(japanese?.release_date?.date),
+    // 未发售作品 Steam 会填 9998-12-31 之类的占位日期，不能当作确定发售日输出。
+    releaseDate: comingSoon
+      ? null
+      : normalizeReleaseDate(schinese?.release_date?.date) ||
+        normalizeReleaseDate(english?.release_date?.date) ||
+        normalizeReleaseDate(tchinese?.release_date?.date) ||
+        normalizeReleaseDate(japanese?.release_date?.date),
+    comingSoon,
     metadataFailedLanguages,
   };
 }
@@ -1809,6 +1831,7 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     name: metadata.name,
     aliases: metadata.aliases,
     releaseDate: metadata.releaseDate,
+    comingSoon: metadata.comingSoon,
     finalUrl,
     tags,
     developers,
@@ -1826,6 +1849,7 @@ function buildAppTagPayload(result) {
     name: result.name,
     aliases: result.aliases,
     releaseDate: result.releaseDate,
+    comingSoon: result.comingSoon,
     tags: result.tags,
     developers: result.developers,
   };
