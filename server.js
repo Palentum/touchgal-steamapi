@@ -39,8 +39,9 @@ const RETRY_BASE_DELAY_MS = envInt("RETRY_BASE_DELAY_MS", 800);
 const MAX_RETRY_AFTER_DELAY_MS = envInt("MAX_RETRY_AFTER_DELAY_MS", 30 * 1000);
 const EMPTY_RESULT_RETRY_DELAY_MS = envInt("EMPTY_RESULT_RETRY_DELAY_MS", 1500);
 const APP_TAGS_MAX_FETCH_ATTEMPTS = envInt("APP_TAGS_MAX_FETCH_ATTEMPTS", 3);
-// 单次抓取循环（fetchAppTagsPayload 全部轮次）的总截止时间：超时后不再开启
-// 新一轮或新的重试等待，直接返回已有的不完整结果（路由回 504 并落负缓存）。
+// 单次抓取循环（fetchAppTagsPayload 全部轮次）的总截止时间：轮次边界超时后不再
+// 开新一轮，且 deadline 透传到每次上游请求（收紧单次尝试超时、跳过等不完的退避），
+// 因此是硬上限（误差 ≤ 一次尝试的超时）。超时返回不完整结果（路由回 504 + 负缓存）。
 const APP_TAGS_TOTAL_DEADLINE_MS = envInt("APP_TAGS_TOTAL_DEADLINE_MS", 90 * 1000);
 const APP_DETAILS_CACHE_TTL_MS = envInt(
   "APP_DETAILS_CACHE_TTL_MS",
@@ -491,17 +492,29 @@ function isRetryableError(err) {
   );
 }
 
-async function requestWithRetry(client, config) {
+// deadlineAt（可选，Date.now() 基准的绝对时间戳）是剩余预算上限：单次尝试的
+// timeout 收紧为 min(配置超时, 剩余预算)；剩余预算不够等完退避就不再重试——
+// 状态码路径直接返回最后一次响应（与耗尽重试同语义），错误路径直接抛出。
+async function requestWithRetry(client, config, { deadlineAt = null } = {}) {
+  const remainingMs = () =>
+    deadlineAt == null ? Infinity : deadlineAt - Date.now();
   let lastError = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const remaining = remainingMs();
+    if (remaining <= 0) {
+      throw lastError || new Error("上游请求总预算已耗尽");
+    }
+
+    const configuredTimeout =
+      Number.isFinite(Number(config.timeout)) && Number(config.timeout) > 0
+        ? Number(config.timeout)
+        : REQUEST_TIMEOUT_MS;
+
     try {
       const response = await client.request({
         ...config,
-        timeout:
-          Number.isFinite(Number(config.timeout)) && Number(config.timeout) > 0
-            ? Number(config.timeout)
-            : REQUEST_TIMEOUT_MS,
+        timeout: Math.min(configuredTimeout, remaining),
         validateStatus: () => true,
       });
 
@@ -518,6 +531,10 @@ async function requestWithRetry(client, config) {
             ? Math.min(retryAfterSec * 1000, MAX_RETRY_AFTER_DELAY_MS)
             : RETRY_BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 250);
 
+        if (delay >= remainingMs()) {
+          return response;
+        }
+
         await sleep(delay);
         continue;
       }
@@ -532,6 +549,11 @@ async function requestWithRetry(client, config) {
 
       const delay =
         RETRY_BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 250);
+
+      if (delay >= remainingMs()) {
+        throw err;
+      }
+
       await sleep(delay);
     }
   }
@@ -1552,21 +1574,25 @@ function buildAgeGatePayload($, form) {
   return payload;
 }
 
-async function passAgeGateIfNeeded(client, appid, lang) {
+async function passAgeGateIfNeeded(client, appid, lang, deadlineAt = null) {
   const ageUrl = `https://store.steampowered.com/agecheck/app/${appid}/?l=${encodeURIComponent(
     lang
   )}`;
 
-  const ageGet = await requestWithRetry(client, {
-    method: "GET",
-    url: ageUrl,
-    headers: {
-      ...buildRequestHeaders(lang),
-      Referer: `https://store.steampowered.com/app/${appid}/?l=${encodeURIComponent(
-        lang
-      )}`,
+  const ageGet = await requestWithRetry(
+    client,
+    {
+      method: "GET",
+      url: ageUrl,
+      headers: {
+        ...buildRequestHeaders(lang),
+        Referer: `https://store.steampowered.com/app/${appid}/?l=${encodeURIComponent(
+          lang
+        )}`,
+      },
     },
-  });
+    { deadlineAt }
+  );
 
   let html = typeof ageGet.data === "string" ? ageGet.data : "";
   let finalUrl = getFinalUrl(ageGet, ageUrl);
@@ -1594,16 +1620,20 @@ async function passAgeGateIfNeeded(client, appid, lang) {
   const actionUrl = new URL(action, ageUrl).toString();
   const payload = buildAgeGatePayload($, form);
 
-  const agePost = await requestWithRetry(client, {
-    method: "POST",
-    url: actionUrl,
-    data: new URLSearchParams(payload).toString(),
-    headers: {
-      ...buildRequestHeaders(lang),
-      "Content-Type": "application/x-www-form-urlencoded",
-      Referer: ageUrl,
+  const agePost = await requestWithRetry(
+    client,
+    {
+      method: "POST",
+      url: actionUrl,
+      data: new URLSearchParams(payload).toString(),
+      headers: {
+        ...buildRequestHeaders(lang),
+        "Content-Type": "application/x-www-form-urlencoded",
+        Referer: ageUrl,
+      },
     },
-  });
+    { deadlineAt }
+  );
 
   html = typeof agePost.data === "string" ? agePost.data : "";
   finalUrl = getFinalUrl(agePost, actionUrl);
@@ -1658,13 +1688,15 @@ function extractTags(html) {
   };
 }
 
-async function fetchAppDetails(client, appid, lang) {
+async function fetchAppDetails(client, appid, lang, deadlineAt = null) {
   const cacheKey = `${appid}:${lang}`;
   const cachedEntry = getCacheEntry(appDetailsCache, cacheKey);
   if (cachedEntry) {
     return cachedEntry.missing ? null : cachedEntry;
   }
 
+  // 命中在途去重时沿用发起方的 deadline，join 方自身的预算不生效；
+  // 发起方预算不足导致的失败不写缓存，join 方可在自己的下一轮重试恢复。
   if (appDetailsInflightRequests.has(cacheKey)) {
     return appDetailsInflightRequests.get(cacheKey);
   }
@@ -1674,11 +1706,15 @@ async function fetchAppDetails(client, appid, lang) {
   )}&l=${encodeURIComponent(lang)}`;
 
   const requestPromise = (async () => {
-    const response = await requestWithRetry(client, {
-      method: "GET",
-      url,
-      headers: buildRequestHeaders(lang),
-    });
+    const response = await requestWithRetry(
+      client,
+      {
+        method: "GET",
+        url,
+        headers: buildRequestHeaders(lang),
+      },
+      { deadlineAt }
+    );
 
     // 非 2xx（重试耗尽后的 429/5xx 也会走到这）和响应体解析失败是上游故障，
     // 不是"查无此 app"：抛错且不写负缓存，否则一次瞬时限流会被当成 app 不存在
@@ -1727,10 +1763,10 @@ async function fetchAppDetails(client, appid, lang) {
   }
 }
 
-async function fetchLocalizedAppMetadata(client, appid) {
+async function fetchLocalizedAppMetadata(client, appid, deadlineAt = null) {
   const languages = ["schinese", "english", "japanese", "tchinese"];
   const detailRequests = await Promise.allSettled(
-    languages.map((lang) => fetchAppDetails(client, appid, lang))
+    languages.map((lang) => fetchAppDetails(client, appid, lang, deadlineAt))
   );
 
   const [schinese, english, japanese, tchinese] = detailRequests.map((result) =>
@@ -1777,7 +1813,7 @@ async function fetchLocalizedAppMetadata(client, appid) {
 }
 
 async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
-  const { useStoredAuthCookies = true } = options;
+  const { useStoredAuthCookies = true, deadlineAt = null } = options;
   const jar = new CookieJar();
   await seedJar(jar, rawCookieHeader, {
     useStoredAuthCookies,
@@ -1788,28 +1824,36 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     lang
   )}`;
 
-  let response = await requestWithRetry(client, {
-    method: "GET",
-    url: appUrl,
-    headers: buildRequestHeaders(lang),
-  });
+  let response = await requestWithRetry(
+    client,
+    {
+      method: "GET",
+      url: appUrl,
+      headers: buildRequestHeaders(lang),
+    },
+    { deadlineAt }
+  );
 
   let html = typeof response.data === "string" ? response.data : "";
   let finalUrl = getFinalUrl(response, appUrl);
   let ageGateHandled = false;
 
   if (isAgeGate(html, finalUrl)) {
-    const ageResult = await passAgeGateIfNeeded(client, appid, lang);
+    const ageResult = await passAgeGateIfNeeded(client, appid, lang, deadlineAt);
     ageGateHandled = ageResult.handled;
 
-    response = await requestWithRetry(client, {
-      method: "GET",
-      url: appUrl,
-      headers: {
-        ...buildRequestHeaders(lang),
-        Referer: ageResult.finalUrl || appUrl,
+    response = await requestWithRetry(
+      client,
+      {
+        method: "GET",
+        url: appUrl,
+        headers: {
+          ...buildRequestHeaders(lang),
+          Referer: ageResult.finalUrl || appUrl,
+        },
       },
-    });
+      { deadlineAt }
+    );
 
     html = typeof response.data === "string" ? response.data : "";
     finalUrl = getFinalUrl(response, appUrl);
@@ -1820,7 +1864,7 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
   const { tags, developers } = redirectedOff
     ? { tags: [], developers: [] }
     : extractTags(html);
-  const metadata = await fetchLocalizedAppMetadata(client, appid);
+  const metadata = await fetchLocalizedAppMetadata(client, appid, deadlineAt);
 
   const usedAuthenticatedCookie = Boolean(
     rawCookieHeader || (useStoredAuthCookies && hasStoredAuthCookies())
@@ -1880,8 +1924,9 @@ function sendIncompleteTagsResponse(res, payload) {
 async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}) {
   const { shouldAbort = () => false } = options;
   const requestHasExplicitCookie = Boolean(requestCookie);
-  // 总截止时间只在轮次边界检查，不打断在途的上游请求：超时后不再开新一轮，
-  // 走底部 complete: false 返回（504 + 负缓存），而非 aborted（不回响应）。
+  // 总截止时间在轮次边界检查，并透传到每次上游请求：剩余预算收紧单次尝试的
+  // timeout、不够等完退避就放弃重试，因此是硬上限（误差 ≤ 一次尝试的超时）。
+  // 超时后走底部 complete: false 返回（504 + 负缓存），而非 aborted（不回响应）。
   const deadlineAt = Date.now() + APP_TAGS_TOTAL_DEADLINE_MS;
   const deadlineExceeded = () => Date.now() >= deadlineAt;
   let lastResult = null;
@@ -1893,9 +1938,18 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
     !deadlineExceeded();
     attempt++
   ) {
-    const anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
-      useStoredAuthCookies: false,
-    });
+    // 预算耗尽导致的抛错（收紧超时 / 退避等不完）降级走底部 complete: false
+    // （504 + 负缓存，保留已有部分数据）；真上游故障维持原语义，抛给路由回 502。
+    let anonymousResult;
+    try {
+      anonymousResult = await fetchSteamTags(appid, lang, requestCookie, {
+        useStoredAuthCookies: false,
+        deadlineAt,
+      });
+    } catch (err) {
+      if (deadlineExceeded()) break;
+      throw err;
+    }
     let result = anonymousResult;
     lastResult = anonymousResult;
 
@@ -1910,9 +1964,16 @@ async function fetchAppTagsPayload(appid, lang, requestCookie = "", options = {}
         ));
 
     if (shouldRetryWithStoredAuth) {
-      const authenticatedResult = await fetchSteamTags(appid, lang, "", {
-        useStoredAuthCookies: true,
-      });
+      let authenticatedResult;
+      try {
+        authenticatedResult = await fetchSteamTags(appid, lang, "", {
+          useStoredAuthCookies: true,
+          deadlineAt,
+        });
+      } catch (err) {
+        if (deadlineExceeded()) break;
+        throw err;
+      }
 
       if (
         scoreSteamResult(authenticatedResult) > scoreSteamResult(anonymousResult) ||
