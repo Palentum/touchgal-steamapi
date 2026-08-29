@@ -30,6 +30,41 @@ const app = express();
 const PORT = Number(process.env.PORT || 8765);
 const HOST = String(process.env.HOST || "127.0.0.1").trim() || "127.0.0.1";
 const DEFAULT_LANG = process.env.DEFAULT_LANG || "schinese";
+// Steam 官方 API 语言码白名单。lang 会拼进缓存键并透传给 Steam，而 Steam 对
+// 无法识别的 l 值照常返回完整页面——不做白名单时每个新造 lang 都是一次必然
+// 写入缓存的完整抓取，可低成本冲刷 appTagResponseCache 的全部槽位。
+const STEAM_SUPPORTED_LANGS = new Set([
+  "arabic",
+  "brazilian",
+  "bulgarian",
+  "czech",
+  "danish",
+  "dutch",
+  "english",
+  "finnish",
+  "french",
+  "german",
+  "greek",
+  "hungarian",
+  "indonesian",
+  "italian",
+  "japanese",
+  "koreana",
+  "latam",
+  "norwegian",
+  "polish",
+  "portuguese",
+  "romanian",
+  "russian",
+  "schinese",
+  "spanish",
+  "swedish",
+  "tchinese",
+  "thai",
+  "turkish",
+  "ukrainian",
+  "vietnamese",
+]);
 const REQUEST_TIMEOUT_MS = envInt("REQUEST_TIMEOUT_MS", 10000);
 // 语义为"总尝试次数"（含首次请求），必须 ≥ 1
 const MAX_RETRIES = envInt("MAX_RETRIES", 3);
@@ -2198,7 +2233,10 @@ app.post(
 
 app.get("/api/app/:appid/tags", publicTagsRateLimiter, async (req, res) => {
   const rawAppid = req.params.appid;
-  const lang = String(req.query.lang || DEFAULT_LANG).trim();
+  const rawLang = String(req.query.lang || DEFAULT_LANG)
+    .trim()
+    .toLowerCase();
+  const lang = STEAM_SUPPORTED_LANGS.has(rawLang) ? rawLang : DEFAULT_LANG;
   const requestCookie = req.header("x-steam-cookie") || "";
   const requestHasExplicitCookie = Boolean(requestCookie);
   let requestClosed = false;
