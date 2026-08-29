@@ -235,13 +235,14 @@ let isShuttingDown = false;
 
 app.set("trust proxy", TRUST_PROXY_SETTING);
 app.disable("x-powered-by");
-app.use(express.json({ limit: JSON_BODY_LIMIT }));
+// 安全响应头必须先于 express.json 注册，否则 body 解析失败的响应不带这些头
 app.use((req, res, next) => {
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   next();
 });
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -2352,6 +2353,54 @@ app.get("/api/app/:appid/tags", publicTagsRateLimiter, async (req, res) => {
       message,
     });
   }
+});
+
+// 以下两个中间件必须注册在所有路由之后
+app.use((_req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "NOT_FOUND",
+    message: "接口不存在",
+  });
+});
+
+app.use((err, _req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  if (err?.type === "entity.parse.failed") {
+    return res.status(400).json({
+      success: false,
+      error: "INVALID_JSON",
+      message: "请求体不是合法的 JSON",
+    });
+  }
+
+  if (err?.type === "entity.too.large") {
+    return res.status(413).json({
+      success: false,
+      error: "PAYLOAD_TOO_LARGE",
+      message: `请求体超过大小限制（${JSON_BODY_LIMIT}）`,
+    });
+  }
+
+  // body-parser 的其他客户端错误（不支持的 charset/Content-Encoding 等）统一带 4xx statusCode
+  if (Number.isInteger(err?.statusCode) && err.statusCode >= 400 && err.statusCode < 500) {
+    return res.status(err.statusCode).json({
+      success: false,
+      error: "BAD_REQUEST",
+      message: "请求体无法解析",
+    });
+  }
+
+  // 堆栈只写日志，响应固定文案，避免泄漏内部路径
+  console.error("[error] 未处理的请求错误:", err);
+  return res.status(500).json({
+    success: false,
+    error: "INTERNAL_ERROR",
+    message: "服务器内部错误",
+  });
 });
 
 function warnIfAdminApiDisabled() {
