@@ -462,10 +462,10 @@ function createRateLimiter({ namespace, windowMs, maxRequests, buckets }) {
     const bucket = buckets.get(bucketKey) || [];
     const recentTimestamps = bucket.filter((timestamp) => now - timestamp < windowMs);
 
-    recentTimestamps.push(now);
-    buckets.set(bucketKey, recentTimestamps);
-
-    if (recentTimestamps.length > maxRequests) {
+    // 先判后记：被拒绝的请求不计入窗口，否则持续流量会让桶永远排不干，
+    // Retry-After 也会与实际可重试时间脱节（最老记录滑出窗口后必须真的空出配额）。
+    if (recentTimestamps.length >= maxRequests) {
+      buckets.set(bucketKey, recentTimestamps);
       const retryAfterSeconds = Math.max(
         1,
         Math.ceil((windowMs - (now - recentTimestamps[0])) / 1000)
@@ -478,6 +478,8 @@ function createRateLimiter({ namespace, windowMs, maxRequests, buckets }) {
       });
     }
 
+    recentTimestamps.push(now);
+    buckets.set(bucketKey, recentTimestamps);
     next();
   };
 }
