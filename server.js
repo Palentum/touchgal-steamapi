@@ -766,20 +766,25 @@ function setManagedSteamCookies(cookieStrings = [], source = null) {
   steamCookieState.source = source;
 }
 
+async function setCookieSafely(jar, cookieString, url) {
+  try {
+    await jar.setCookie(cookieString, url);
+  } catch {
+    // 忽略无法解析的单个 cookie，避免整个请求失败
+  }
+}
+
 async function seedManagedSteamCookies(jar) {
   for (const cookie of steamCookieState.cookies) {
     if (!cookie?.name || !cookie?.domain || isExpiredCookie(cookie)) {
       continue;
     }
 
-    try {
-      await jar.setCookie(
-        serializeCookieForJar(cookie),
-        `https://${cookie.domain}${cookie.path || "/"}`
-      );
-    } catch {
-      // 忽略单个损坏 cookie，避免整个请求失败
-    }
+    await setCookieSafely(
+      jar,
+      serializeCookieForJar(cookie),
+      `https://${cookie.domain}${cookie.path || "/"}`
+    );
   }
 }
 
@@ -793,14 +798,14 @@ async function seedJar(jar, rawCookieHeader = "", options = {}) {
 
   if (useStoredAuthCookies) {
     for (const pair of splitCookieHeader(GLOBAL_STEAM_COOKIE)) {
-      await jar.setCookie(pair, baseUrl);
+      await setCookieSafely(jar, pair, baseUrl);
     }
 
     await seedManagedSteamCookies(jar);
   }
 
   for (const pair of splitCookieHeader(rawCookieHeader)) {
-    await jar.setCookie(pair, baseUrl);
+    await setCookieSafely(jar, pair, baseUrl);
   }
 
   await jar.setCookie(
