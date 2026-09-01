@@ -987,7 +987,9 @@ function getSteamSessionHealthSummary() {
     hasCookies: steamCookieState.cookieCount > 0,
     source: steamCookieState.source,
     lastCookieRefreshOkAt: steamSessionState.lastCookieRefreshOkAt,
-    lastError: steamSessionState.lastError,
+    // 错误原文可能含部署绝对路径（fs 错误消息），只在受保护的 status 接口返回
+    hasError: Boolean(steamSessionState.lastError),
+    lastErrorAt: steamSessionState.lastErrorAt,
     refreshInProgress: steamSessionState.refreshInProgress,
     pendingLoginCount: [...pendingSteamLogins.values()].filter(
       (attempt) => !attempt.completed

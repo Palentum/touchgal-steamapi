@@ -266,7 +266,8 @@ curl http://127.0.0.1:8765/health
     "hasCookies": false,
     "source": null,
     "lastCookieRefreshOkAt": null,
-    "lastError": null,
+    "hasError": false,
+    "lastErrorAt": null,
     "refreshInProgress": false,
     "pendingLoginCount": 0
   }
