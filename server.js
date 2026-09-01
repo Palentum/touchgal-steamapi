@@ -134,7 +134,9 @@ const PUBLIC_ROUTE_WINDOW_MS = envInt("PUBLIC_ROUTE_WINDOW_MS", 60 * 1000);
 const PUBLIC_ROUTE_MAX_REQUESTS = envInt("PUBLIC_ROUTE_MAX_REQUESTS", 30);
 // 部署在反代后面时必须配置，否则 req.ip 恒为反代地址，管理写接口的限流会退化成全局共用一个桶。
 const TRUST_PROXY_SETTING = resolveTrustProxySetting(process.env.TRUST_PROXY);
-const SHUTDOWN_TIMEOUT_MS = envInt("SHUTDOWN_TIMEOUT_MS", 10000);
+// 必须明显小于 PM2 的 kill_timeout（ecosystem.config.js，当前 15000），
+// 否则强制断连的 setTimeout 永远赶不上 SIGKILL，优雅停机分支形同虚设。
+const SHUTDOWN_TIMEOUT_MS = envInt("SHUTDOWN_TIMEOUT_MS", 5000);
 
 // 可选：把你自己浏览器里的 Steam Cookie 整串放到环境变量里。
 // 也可以每次请求时通过 X-Steam-Cookie 请求头单独传入。

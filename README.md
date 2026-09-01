@@ -142,7 +142,7 @@ http://127.0.0.1:8765
 | `PUBLIC_ROUTE_WINDOW_MS` | `60000` | 公开接口 `/api/app/:appid/tags` 的限流窗口（毫秒） |
 | `PUBLIC_ROUTE_MAX_REQUESTS` | `30` | 单个客户端在限流窗口内允许访问公开接口的最大次数，超过返回 `429` |
 | `TRUST_PROXY` | 空（不信任） | 部署在 Nginx 等反代后面时必填，否则 `req.ip` 恒为反代地址、上面的限流会退化成所有调用者共用一个桶。取值：数字表示信任的反代跳数（单层反代填 `1`）、`true` 表示全信任、也接受 IP / CIDR / `loopback` 等 Express 预设名 |
-| `SHUTDOWN_TIMEOUT_MS` | `10000` | 进程收到退出信号后的优雅停机等待时间（毫秒），超过后会强制断开剩余连接 |
+| `SHUTDOWN_TIMEOUT_MS` | `5000` | 进程收到退出信号后的优雅停机等待时间（毫秒），超过后会强制断开剩余连接。必须明显小于 PM2 的 `kill_timeout`（`ecosystem.config.js`，当前 `15000`），否则强制断连来不及在 SIGKILL 前触发，进程会被直接杀死 |
 
 示例：
 
