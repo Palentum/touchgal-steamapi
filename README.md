@@ -28,10 +28,10 @@
 
 ## 技术栈
 
-- Node.js ≥ 22.12（`socks-proxy-agent`、`axios-cookiejar-support` 为纯 ESM 包，依赖 `require(ESM)` 支持，低版本启动即抛 `ERR_REQUIRE_ESM`）
+- Node.js ≥ 22.12（`socks-proxy-agent` 为纯 ESM 包，依赖 `require(ESM)` 支持，低版本启动即抛 `ERR_REQUIRE_ESM`）
 - Express
 - Axios
-- axios-cookiejar-support
+- http-cookie-agent
 - tough-cookie
 - Cheerio
 - steam-session

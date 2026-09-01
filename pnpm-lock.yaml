@@ -16,9 +16,6 @@ importers:
       axios:
         specifier: ^1.13.6
         version: 1.18.0
-      axios-cookiejar-support:
-        specifier: ^6.0.5
-        version: 6.0.5(axios@1.18.0)(tough-cookie@6.0.1)(undici@7.27.2)
       cheerio:
         specifier: ^1.2.0
         version: 1.2.0
@@ -28,6 +25,12 @@ importers:
       express:
         specifier: ^5.2.1
         version: 5.2.1
+      http-cookie-agent:
+        specifier: ^7.0.4
+        version: 7.0.4(tough-cookie@6.0.1)(undici@7.27.2)
+      socks-proxy-agent:
+        specifier: ^10.1.0
+        version: 10.1.0
       steam-session:
         specifier: ^1.9.4
         version: 1.9.4
@@ -142,13 +145,6 @@ packages:
 
   asynckit@0.4.0:
     resolution: {integrity: sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q==}
-
-  axios-cookiejar-support@6.0.5:
-    resolution: {integrity: sha512-ldPOQCJWB0ipugkTNVB8QRl/5L2UgfmVNVQtS9en1JQJ1wW588PqAmymnwmmgc12HLDzDtsJ28xE2ppj4rD4ng==}
-    engines: {node: '>=20.0.0'}
-    peerDependencies:
-      axios: '>=0.20.0'
-      tough-cookie: '>=4.0.0'
 
   axios@1.18.0:
     resolution: {integrity: sha512-E32NzpYKp++W7XRe52rHiXV2ehxmh3wbdgO7MHeFM+vqxLBYHzt0ElkiImtOBxtOmyp0yoC8C6uESVV84Y2/hw==}
@@ -780,6 +776,10 @@ packages:
     resolution: {integrity: sha512-94hK0Hh8rPqQl2xXc3HsaBoOXKV20MToPkcXvwbISWLEs+64sBq5kFgn2kJDHb1Pry9yrP0dxrCI9RRci7RXKg==}
     engines: {node: '>= 6.0.0', npm: '>= 3.0.0'}
 
+  socks-proxy-agent@10.1.0:
+    resolution: {integrity: sha512-WlMj/67cEJ6MDI1OcsnjuYKDNDoyPCCYZ249kuuXPiMDw9F8PXkVaQ7YWu3siTydfQ/4BEZcvGzu+aYvz7dDCQ==}
+    engines: {node: '>= 20'}
+
   socks-proxy-agent@7.0.0:
     resolution: {integrity: sha512-Fgl0YPZ902wEsAyiQ+idGd1A7rSFx/ayC1CQVMw5P+EQx2V0SgpGtf6OKFhVjPflPUl9YMmEOnmfjCdMUsygww==}
     engines: {node: '>= 10'}
@@ -1016,14 +1016,6 @@ snapshots:
   async@3.2.6: {}
 
   asynckit@0.4.0: {}
-
-  axios-cookiejar-support@6.0.5(axios@1.18.0)(tough-cookie@6.0.1)(undici@7.27.2):
-    dependencies:
-      axios: 1.18.0
-      http-cookie-agent: 7.0.4(tough-cookie@6.0.1)(undici@7.27.2)
-      tough-cookie: 6.0.1
-    transitivePeerDependencies:
-      - undici
 
   axios@1.18.0:
     dependencies:
@@ -1753,6 +1745,14 @@ snapshots:
       side-channel-weakmap: 1.0.2
 
   smart-buffer@4.2.0: {}
+
+  socks-proxy-agent@10.1.0:
+    dependencies:
+      agent-base: 9.0.0
+      debug: 4.4.3
+      socks: 2.8.9
+    transitivePeerDependencies:
+      - supports-color
 
   socks-proxy-agent@7.0.0:
     dependencies:
