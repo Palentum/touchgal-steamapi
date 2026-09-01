@@ -1,6 +1,7 @@
 node_modules/
 .env
 steam-session-auth.json
+steam-session-auth.json.tmp
 
 # Claude Code 本地工作区（不入库）
 CLAUDE.md

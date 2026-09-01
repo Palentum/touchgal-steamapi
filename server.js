@@ -230,6 +230,7 @@ const pendingSteamLogins = new Map();
 
 let steamCookieRefreshPromise = null;
 let steamCookieRefreshTimer = null;
+let steamSessionPersistChain = Promise.resolve();
 let server = null;
 let isShuttingDown = false;
 
@@ -998,22 +999,10 @@ function getSteamSessionHealthSummary() {
 }
 
 async function loadPersistedSteamSessionState() {
+  let raw;
+
   try {
-    const raw = await fs.readFile(STEAM_SESSION_STORE_PATH, "utf8");
-    const payload = safeParseJson(raw);
-
-    steamSessionState.refreshToken = String(payload?.refreshToken || "").trim();
-    steamSessionState.accountName = payload?.accountName || null;
-    steamSessionState.steamId = payload?.steamId || null;
-    steamSessionState.lastAuthenticatedAt = payload?.lastAuthenticatedAt || null;
-    steamSessionState.lastCookieRefreshAt = payload?.lastCookieRefreshAt || null;
-    steamSessionState.lastCookieRefreshOkAt =
-      payload?.lastCookieRefreshOkAt || null;
-
-    const cookieStrings = Array.isArray(payload?.cookieStrings)
-      ? payload.cookieStrings
-      : [];
-    setManagedSteamCookies(cookieStrings, cookieStrings.length ? "persisted_file" : null);
+    raw = await fs.readFile(STEAM_SESSION_STORE_PATH, "utf8");
   } catch (err) {
     if (err?.code === "ENOENT") {
       return;
@@ -1021,10 +1010,42 @@ async function loadPersistedSteamSessionState() {
 
     steamSessionState.lastError = `读取 steam-session 持久化文件失败: ${err.message}`;
     steamSessionState.lastErrorAt = new Date().toISOString();
+    return;
   }
+
+  const payload = safeParseJson(raw);
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    // 文件损坏必须显式暴露：否则服务会安静退化成纯匿名抓取，/health 看不到任何异常
+    steamSessionState.lastError =
+      "steam-session 持久化文件内容损坏（非合法 JSON 对象），已跳过加载，需重新交互登录";
+    steamSessionState.lastErrorAt = new Date().toISOString();
+    console.error(`[steam-session] ${steamSessionState.lastError}`);
+    return;
+  }
+
+  steamSessionState.refreshToken = String(payload?.refreshToken || "").trim();
+  steamSessionState.accountName = payload?.accountName || null;
+  steamSessionState.steamId = payload?.steamId || null;
+  steamSessionState.lastAuthenticatedAt = payload?.lastAuthenticatedAt || null;
+  steamSessionState.lastCookieRefreshAt = payload?.lastCookieRefreshAt || null;
+  steamSessionState.lastCookieRefreshOkAt =
+    payload?.lastCookieRefreshOkAt || null;
+
+  const cookieStrings = Array.isArray(payload?.cookieStrings)
+    ? payload.cookieStrings
+    : [];
+  setManagedSteamCookies(cookieStrings, cookieStrings.length ? "persisted_file" : null);
 }
 
-async function persistSteamSessionState() {
+function persistSteamSessionState() {
+  // 登录回调与定时刷新可能并发落盘，串行化避免交错写坏文件
+  const task = steamSessionPersistChain.then(writeSteamSessionStateToDisk);
+  // 链尾吞掉失败，避免一次写盘失败拒绝掉后续所有持久化；错误仍经 task 抛给本次调用方
+  steamSessionPersistChain = task.catch(() => {});
+  return task;
+}
+
+async function writeSteamSessionStateToDisk() {
   await fs.mkdir(path.dirname(STEAM_SESSION_STORE_PATH), {
     recursive: true,
   });
@@ -1045,20 +1066,20 @@ async function persistSteamSessionState() {
     2
   );
 
-  await fs.writeFile(
-    STEAM_SESSION_STORE_PATH,
-    serializedState,
-    {
-      encoding: "utf8",
-      mode: 0o600,
-    }
-  );
+  // 先写同目录临时文件再 rename 原子替换：ENOSPC / 进程被杀只会损坏临时文件，正式文件保持完好
+  const tmpPath = `${STEAM_SESSION_STORE_PATH}.tmp`;
+  await fs.writeFile(tmpPath, serializedState, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
 
   try {
-    await fs.chmod(STEAM_SESSION_STORE_PATH, 0o600);
+    await fs.chmod(tmpPath, 0o600);
   } catch {
     // 忽略 chmod 失败，避免非 POSIX 环境下持久化直接报错
   }
+
+  await fs.rename(tmpPath, STEAM_SESSION_STORE_PATH);
 }
 
 function formatSteamSessionError(err) {
