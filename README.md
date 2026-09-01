@@ -135,7 +135,7 @@ http://127.0.0.1:8765
 | `STEAM_SESSION_LOGIN_TIMEOUT_MS` | `300000` | 单次交互式登录的超时时间（毫秒） |
 | `STEAM_SESSION_LOGIN_ATTEMPT_TTL_MS` | `600000` | 登录会话在内存中保留的时长（毫秒） |
 | `STEAM_SESSION_COOKIE_DOMAINS` | `store.steampowered.com,steamcommunity.com,help.steampowered.com` | 自动映射 Cookie 的域名列表，逗号分隔 |
-| `JSON_BODY_LIMIT` | `16kb` | JSON 请求体大小限制 |
+| `JSON_BODY_LIMIT` | `16kb` | JSON 请求体大小限制。必须是 `bytes` 能解析的值（如 `16kb`、`1mb`）；无法解析或小于 1024 字节的值会在启动时打印告警并回退为 `16kb` |
 | `ADMIN_API_KEY` | 空 | **启用管理接口的必要条件**。`/api/steam-auth/*` 和 `/api/steam-cookies/*` 需要 `X-API-Key` 或 `Authorization: Bearer <key>`。未配置、使用占位值（如 `replace_me`）或长度不足 16 位时，这些接口一律返回 `403`，交互式登录不可用（不影响 `/api/app/:appid/tags`）。建议用 `openssl rand -hex 32` 生成 |
 | `ADMIN_ROUTE_WINDOW_MS` | `300000` | 管理写接口限流窗口（毫秒） |
 | `ADMIN_ROUTE_MAX_REQUESTS` | `12` | 单个客户端在限流窗口内允许访问管理写接口的最大次数 |

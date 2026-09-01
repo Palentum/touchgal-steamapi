@@ -4,6 +4,7 @@ const path = require("path");
 const dotenv = require("dotenv");
 const { randomUUID, timingSafeEqual } = require("crypto");
 const axios = require("axios");
+const bytes = require("bytes");
 const { CookieJar, Cookie } = require("tough-cookie");
 const cheerio = require("cheerio");
 const { SocksProxyAgent } = require("socks-proxy-agent");
@@ -121,7 +122,25 @@ const STEAM_SESSION_COOKIE_DOMAINS = parseCsvList(
   process.env.STEAM_SESSION_COOKIE_DOMAINS ||
     "store.steampowered.com,steamcommunity.com,help.steampowered.com"
 );
-const JSON_BODY_LIMIT = String(process.env.JSON_BODY_LIMIT || "16kb").trim() || "16kb";
+// bytes.parse 解析失败返回 null，而 body-parser@2 把 null limit 当作"不限制"；
+// 过小值（如 "16KiB" 实际解析为 16 字节）则让所有带 body 的请求一律 413。
+// 两类误配都回退默认值，后续统一使用解析后的字节数，避免 body-parser 二次解析。
+const JSON_BODY_LIMIT_DEFAULT = "16kb";
+const JSON_BODY_LIMIT_MIN_BYTES = 1024;
+const JSON_BODY_LIMIT = (() => {
+  const raw =
+    String(process.env.JSON_BODY_LIMIT || JSON_BODY_LIMIT_DEFAULT).trim() ||
+    JSON_BODY_LIMIT_DEFAULT;
+  const parsed = bytes.parse(raw);
+  if (parsed === null || parsed < JSON_BODY_LIMIT_MIN_BYTES) {
+    console.warn(
+      `[config] JSON_BODY_LIMIT="${raw}" 无效（无法解析或小于 ${JSON_BODY_LIMIT_MIN_BYTES} 字节），已回退为 ${JSON_BODY_LIMIT_DEFAULT}`
+    );
+    return JSON_BODY_LIMIT_DEFAULT;
+  }
+  return raw;
+})();
+const JSON_BODY_LIMIT_BYTES = bytes.parse(JSON_BODY_LIMIT);
 const ADMIN_API_KEY_MIN_LENGTH = 16;
 const ADMIN_API_KEY_PLACEHOLDERS = new Set([
   "replace_me",
@@ -242,14 +261,16 @@ let isShuttingDown = false;
 
 app.set("trust proxy", TRUST_PROXY_SETTING);
 app.disable("x-powered-by");
-// 安全响应头必须先于 express.json 注册，否则 body 解析失败的响应不带这些头
+// 安全响应头必须先于所有路由注册，否则 body 解析失败等提前返回的响应不带这些头
 app.use((req, res, next) => {
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   next();
 });
-app.use(express.json({ limit: JSON_BODY_LIMIT }));
+// 全服务只有 login/start 和 submit-guard 两个管理路由读 req.body，JSON 解析只挂
+// 在这两处且位于鉴权之后——公开路由、未知路径和未授权请求都不预缓冲请求体。
+const jsonBodyParser = express.json({ limit: JSON_BODY_LIMIT_BYTES });
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -2173,6 +2194,7 @@ app.post(
   "/api/steam-auth/login/start",
   requireAdminAccess,
   steamMutationRateLimiter,
+  jsonBodyParser,
   async (req, res) => {
     const accountName = String(req.body?.accountName || "").trim();
     const password = String(req.body?.password || "");
@@ -2229,6 +2251,7 @@ app.post(
   "/api/steam-auth/login/submit-guard",
   requireAdminAccess,
   steamMutationRateLimiter,
+  jsonBodyParser,
   async (req, res) => {
     const loginId = String(req.body?.loginId || "").trim();
     const code = String(req.body?.code || "").trim();
