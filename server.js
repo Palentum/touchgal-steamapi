@@ -4,11 +4,14 @@ const path = require("path");
 const dotenv = require("dotenv");
 const { randomUUID, timingSafeEqual } = require("crypto");
 const axios = require("axios");
-const { wrapper } = require("axios-cookiejar-support");
 const { CookieJar, Cookie } = require("tough-cookie");
 const cheerio = require("cheerio");
 const { SocksProxyAgent } = require("socks-proxy-agent");
-const { createCookieAgent } = require("http-cookie-agent/http");
+const {
+  createCookieAgent,
+  HttpCookieAgent,
+  HttpsCookieAgent,
+} = require("http-cookie-agent/http");
 const {
   LoginSession,
   EAuthSessionGuardType,
@@ -149,8 +152,9 @@ const DEFAULT_USER_AGENT =
 // 可选：所有对外请求（Steam 商店抓取 + steam-session 登录/刷新）走 SOCKS5 代理。
 // 格式：socks5://user:pass@host:port 或 socks5h://host:port（socks5h 由代理端解析域名）。
 const SOCKS5_PROXY_URL = parseSocks5ProxyUrl(process.env.SOCKS5_PROXY_URL);
-// axios-cookiejar-support 的 wrapper 不允许外部 Agent，代理模式下改用
-// http-cookie-agent（wrapper 的底层实现）直接组合出 cookie + SOCKS5 的 Agent。
+// 直连与代理两条路径都用 http-cookie-agent 直接组合 cookie Agent，不走
+// axios-cookiejar-support 的 wrapper——后者会给每个请求新建 keepAlive:false
+// 的 Agent，出站连接零复用；代理模式在此基础上叠加 SOCKS5。
 const SocksCookieAgent = createCookieAgent(SocksProxyAgent);
 
 function parseSocks5ProxyUrl(value = "") {
@@ -800,30 +804,56 @@ async function seedJar(jar, rawCookieHeader = "", options = {}) {
   );
 }
 
+// CookieAgent 默认 keepAlive:false，每次上游调用都要完整重做 TCP+TLS 握手。
+// 统一开启 keepAlive 让同一次抓取内的请求（商店页、年龄门、四语言 appdetails、
+// 重试与重定向各跳）复用连接；maxSockets 同时充当单次抓取的出站并发上限。
+const OUTBOUND_AGENT_OPTIONS = { keepAlive: true, maxSockets: 8 };
+
+// agent 与 jar 同生命周期（按 fetch 创建），调用方用完必须调 destroy()，
+// 否则 keepAlive 的空闲连接会一直挂到对端关闭。
 function createClient(jar) {
   if (SOCKS5_PROXY_URL) {
     const proxyCookieAgent = new SocksCookieAgent(SOCKS5_PROXY_URL, {
+      ...OUTBOUND_AGENT_OPTIONS,
       cookies: { jar },
     });
 
-    return axios.create({
-      withCredentials: true,
-      maxRedirects: 5,
-      decompress: true,
-      httpAgent: proxyCookieAgent,
-      httpsAgent: proxyCookieAgent,
-      proxy: false,
-    });
+    return {
+      client: axios.create({
+        withCredentials: true,
+        maxRedirects: 5,
+        decompress: true,
+        httpAgent: proxyCookieAgent,
+        httpsAgent: proxyCookieAgent,
+        proxy: false,
+      }),
+      destroy: () => proxyCookieAgent.destroy(),
+    };
   }
 
-  return wrapper(
-    axios.create({
-      jar,
+  const httpAgent = new HttpCookieAgent({
+    ...OUTBOUND_AGENT_OPTIONS,
+    cookies: { jar },
+  });
+  const httpsAgent = new HttpsCookieAgent({
+    ...OUTBOUND_AGENT_OPTIONS,
+    cookies: { jar },
+  });
+
+  return {
+    client: axios.create({
       withCredentials: true,
       maxRedirects: 5,
       decompress: true,
-    })
-  );
+      httpAgent,
+      httpsAgent,
+      proxy: false,
+    }),
+    destroy: () => {
+      httpAgent.destroy();
+      httpsAgent.destroy();
+    },
+  };
 }
 
 function getFinalUrl(response, fallback) {
@@ -1882,72 +1912,81 @@ async function fetchSteamTags(appid, lang, rawCookieHeader = "", options = {}) {
     useStoredAuthCookies,
   });
 
-  const client = createClient(jar);
+  const { client, destroy } = createClient(jar);
   const appUrl = `https://store.steampowered.com/app/${appid}/?l=${encodeURIComponent(
     lang
   )}`;
 
-  let response = await requestWithRetry(
-    client,
-    {
-      method: "GET",
-      url: appUrl,
-      headers: buildRequestHeaders(lang),
-    },
-    { deadlineAt }
-  );
-
-  let html = typeof response.data === "string" ? response.data : "";
-  let finalUrl = getFinalUrl(response, appUrl);
-  let ageGateHandled = false;
-
-  if (isAgeGate(html, finalUrl)) {
-    const ageResult = await passAgeGateIfNeeded(client, appid, lang, deadlineAt);
-    ageGateHandled = ageResult.handled;
-
-    response = await requestWithRetry(
+  try {
+    let response = await requestWithRetry(
       client,
       {
         method: "GET",
         url: appUrl,
-        headers: {
-          ...buildRequestHeaders(lang),
-          Referer: ageResult.finalUrl || appUrl,
-        },
+        headers: buildRequestHeaders(lang),
       },
       { deadlineAt }
     );
 
-    html = typeof response.data === "string" ? response.data : "";
-    finalUrl = getFinalUrl(response, appUrl);
+    let html = typeof response.data === "string" ? response.data : "";
+    let finalUrl = getFinalUrl(response, appUrl);
+    let ageGateHandled = false;
+
+    if (isAgeGate(html, finalUrl)) {
+      const ageResult = await passAgeGateIfNeeded(
+        client,
+        appid,
+        lang,
+        deadlineAt
+      );
+      ageGateHandled = ageResult.handled;
+
+      response = await requestWithRetry(
+        client,
+        {
+          method: "GET",
+          url: appUrl,
+          headers: {
+            ...buildRequestHeaders(lang),
+            Referer: ageResult.finalUrl || appUrl,
+          },
+        },
+        { deadlineAt }
+      );
+
+      html = typeof response.data === "string" ? response.data : "";
+      finalUrl = getFinalUrl(response, appUrl);
+    }
+
+    // 302 已离开 app 页时跳过解析：对 1MB 首页做同步 cheerio 解析只会得到空结果并阻塞事件循环
+    const redirectedOff = redirectedOffAppPage(finalUrl, appid);
+    const { tags, developers } = redirectedOff
+      ? { tags: [], developers: [] }
+      : extractTags(html);
+    const metadata = await fetchLocalizedAppMetadata(client, appid, deadlineAt);
+
+    const usedAuthenticatedCookie = Boolean(
+      rawCookieHeader || (useStoredAuthCookies && hasStoredAuthCookies())
+    );
+
+    return {
+      appid: String(appid),
+      name: metadata.name,
+      aliases: metadata.aliases,
+      releaseDate: metadata.releaseDate,
+      comingSoon: metadata.comingSoon,
+      finalUrl,
+      tags,
+      developers,
+      ageGateHandled,
+      usedAuthenticatedCookie,
+      redirectedOffAppPage: redirectedOff,
+      metadataFailedLanguages: metadata.metadataFailedLanguages,
+      rawHtml: html,
+    };
+  } finally {
+    destroy();
   }
-
-  // 302 已离开 app 页时跳过解析：对 1MB 首页做同步 cheerio 解析只会得到空结果并阻塞事件循环
-  const redirectedOff = redirectedOffAppPage(finalUrl, appid);
-  const { tags, developers } = redirectedOff
-    ? { tags: [], developers: [] }
-    : extractTags(html);
-  const metadata = await fetchLocalizedAppMetadata(client, appid, deadlineAt);
-
-  const usedAuthenticatedCookie = Boolean(
-    rawCookieHeader || (useStoredAuthCookies && hasStoredAuthCookies())
-  );
-
-  return {
-    appid: String(appid),
-    name: metadata.name,
-    aliases: metadata.aliases,
-    releaseDate: metadata.releaseDate,
-    comingSoon: metadata.comingSoon,
-    finalUrl,
-    tags,
-    developers,
-    ageGateHandled,
-    usedAuthenticatedCookie,
-    redirectedOffAppPage: redirectedOff,
-    metadataFailedLanguages: metadata.metadataFailedLanguages,
-    rawHtml: html,
-  };
 }
 
 function buildAppTagPayload(result) {
