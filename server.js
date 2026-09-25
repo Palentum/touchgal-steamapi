@@ -1847,7 +1847,14 @@ async function fetchAppDetails(client, appid, lang, deadlineAt = null) {
       throw new Error("appdetails 响应体不是合法 JSON");
     }
 
-    const entry = payload[String(appid)];
+    // Steam 会把部分作品的响应键写成别的 appid（多见于带 DLC 的作品，如
+    // 2957880 → "3759310"、570 → "2120612"），但 data.steam_appid 仍是请求的 app：
+    // 按键取不到时改按 steam_appid 匹配，否则整条元数据会被误判为查无此 app。
+    const entry =
+      payload[String(appid)] ??
+      Object.values(payload).find(
+        (item) => String(item?.data?.steam_appid) === String(appid)
+      );
 
     if (!entry?.success || !entry.data) {
       // 查无此 app 也要短暂缓存（哨兵 { missing: true }，缓存值为 null 会被
