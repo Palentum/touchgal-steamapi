@@ -50,41 +50,43 @@
 ## 安装
 
 ```bash
-npm install
+pnpm install
 cp .env.example .env
 ```
 
 ## 启动
 
 ```bash
-npm start
+pnpm dev       # 开发：node --watch，server.js 改动后自动重启
+pnpm preview   # 前台直接运行 node server.js
 ```
 
 ## 使用 PM2 保持运行
 
 项目已内置 `pm2` 和默认配置文件 `ecosystem.config.js`，适合长期运行和开机自启。
 
-首次启动：
-
 ```bash
-npm run pm2:start
+pnpm start          # pm2 startOrReload：未运行则启动，已运行则 reload
+pnpm stop           # pm2 delete：停止并从 pm2 进程列表移除
+pnpm deploy:build   # 生产更新：git pull → pnpm install --frozen-lockfile → pnpm start
 ```
 
-常用命令：
+`deploy:build` 与 kun-touchgal-dlsite-api 保持同名（`pnpm deploy` 是 pnpm 内置命令，不能直接作脚本名）；本项目没有构建步骤。
+
+其余 pm2 辅助命令：
 
 ```bash
-npm run pm2:logs
-npm run pm2:restart
-npm run pm2:reload
-npm run pm2:stop
-npm run pm2:delete
+pnpm pm2:logs
+pnpm pm2:restart
+pnpm pm2:reload
+pnpm pm2:stop       # 只停止，保留在 pm2 进程列表里
 ```
 
 如果你希望机器重启后自动拉起：
 
 ```bash
-npm run pm2:save
-npx pm2 startup
+pnpm pm2:save
+pnpm exec pm2 startup
 ```
 
 说明：
@@ -158,7 +160,7 @@ TRUST_PROXY=1
 ```
 
 ```bash
-npm start
+pnpm start
 ```
 
 ## 一次性登录流程
