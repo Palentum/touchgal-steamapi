@@ -5,7 +5,7 @@
   "description": "A lightweight Steam Store scraping service with steam-session based cookie refresh.",
   "main": "server.js",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=26.0.0"
   },
   "scripts": {
     "start": "node server.js",

@@ -28,7 +28,7 @@
 
 ## 技术栈
 
-- Node.js ≥ 22.12（`socks-proxy-agent` 为纯 ESM 包，依赖 `require(ESM)` 支持，低版本启动即抛 `ERR_REQUIRE_ESM`）
+- Node.js ≥ 26（与 `.nvmrc` 一致；`socks-proxy-agent` 为纯 ESM 包，依赖 `require(ESM)` 支持，低于 22.12 启动即抛 `ERR_REQUIRE_ESM`）
 - Express
 - Axios
 - http-cookie-agent
